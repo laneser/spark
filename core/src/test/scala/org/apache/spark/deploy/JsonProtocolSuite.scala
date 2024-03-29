@@ -25,7 +25,7 @@ import org.json4s.jackson.JsonMethods
 
 import org.apache.spark.{JsonTestUtils, SparkFunSuite}
 import org.apache.spark.deploy.DeployMessages.{MasterStateResponse, WorkerStateResponse}
-import org.apache.spark.deploy.master.{ApplicationInfo, RecoveryState}
+import org.apache.spark.deploy.master.{ApplicationInfo, RecoveryState, WorkerInfo}
 import org.apache.spark.deploy.worker.ExecutorRunner
 
 class JsonProtocolSuite extends SparkFunSuite with JsonTestUtils {
@@ -76,6 +76,22 @@ class JsonProtocolSuite extends SparkFunSuite with JsonTestUtils {
     assertValidDataInJson(output, JsonMethods.parse(JsonConstants.masterStateJsonStr))
   }
 
+  test("SPARK-45474: filtered writeMasterState") {
+    val workers = Array(createWorkerInfo(), createWorkerInfo())
+    val activeApps = Array(createAppInfo())
+    val completedApps = Array.empty[ApplicationInfo]
+    val activeDrivers = Array(createDriverInfo())
+    val completedDrivers = Array(createDriverInfo())
+    val stateResponse = new MasterStateResponse(
+      "host", 8080, None, workers, activeApps, completedApps,
+      activeDrivers, completedDrivers, RecoveryState.ALIVE)
+    val output = JsonProtocol.writeMasterState(stateResponse, Some("activedrivers"))
+    assertValidJson(output)
+
+    val expected = """{"activedrivers":[%s]}""".format(JsonConstants.driverInfoJsonStr).stripMargin
+    assertValidDataInJson(output, JsonMethods.parse(expected))
+  }
+
   test("writeWorkerState") {
     val executors = List[ExecutorRunner]()
     val finishedExecutors = List[ExecutorRunner](createExecutorRunner(123, true),
@@ -87,6 +103,35 @@ class JsonProtocolSuite extends SparkFunSuite with JsonTestUtils {
     val output = JsonProtocol.writeWorkerState(stateResponse)
     assertValidJson(output)
     assertValidDataInJson(output, JsonMethods.parse(JsonConstants.workerStateJsonStr))
+  }
+
+  test("SPARK-46883: writeClusterUtilization") {
+    val workers = Array(createWorkerInfo(), createWorkerInfo())
+    val activeApps = Array(createAppInfo())
+    val completedApps = Array.empty[ApplicationInfo]
+    val activeDrivers = Array(createDriverInfo())
+    val completedDrivers = Array(createDriverInfo())
+    val stateResponse = new MasterStateResponse(
+      "host", 8080, None, workers, activeApps, completedApps,
+      activeDrivers, completedDrivers, RecoveryState.ALIVE)
+    val output = JsonProtocol.writeClusterUtilization(stateResponse)
+    assertValidJson(output)
+    assertValidDataInJson(output, JsonMethods.parse(JsonConstants.clusterUtilizationJsonStr))
+  }
+
+  test("SPARK-46883: writeClusterUtilization without workers") {
+    val workers = Array.empty[WorkerInfo]
+    val activeApps = Array(createAppInfo())
+    val completedApps = Array.empty[ApplicationInfo]
+    val activeDrivers = Array(createDriverInfo())
+    val completedDrivers = Array(createDriverInfo())
+    val stateResponse = new MasterStateResponse(
+      "host", 8080, None, workers, activeApps, completedApps,
+      activeDrivers, completedDrivers, RecoveryState.ALIVE)
+    val output = JsonProtocol.writeClusterUtilization(stateResponse)
+    assertValidJson(output)
+    assertValidDataInJson(output,
+      JsonMethods.parse(JsonConstants.clusterUtilizationWithoutWorkersJsonStr))
   }
 
   def assertValidJson(json: JValue): Unit = {
@@ -106,9 +151,12 @@ object JsonConstants {
     """
       |{"id":"id","starttime":3,"name":"name",
       |"cores":0,"user":"%s",
+      |"memoryperexecutor":1234,
+      |"resourcesperexecutor":[{"name":"fpga",
+      |"amount":3},{"name":"gpu","amount":3}],
       |"memoryperslave":1234,
-      |"resourcesperslave":[{"name":"gpu",
-      |"amount":3},{"name":"fpga","amount":3}],
+      |"resourcesperslave":[{"name":"fpga",
+      |"amount":3},{"name":"gpu","amount":3}],
       |"submitdate":"%s",
       |"state":"WAITING","duration":%d}
     """.format(System.getProperty("user.name", "<unknown>"),
@@ -125,14 +173,15 @@ object JsonConstants {
       |:["3","4","5"]}},"resourcesused":{"gpu":
       |{"name":"gpu","addresses":[]},"fpga":
       |{"name":"fpga","addresses":[]}},"resourcesfree":
-      |{"gpu":{"name":"gpu","addresses":["2","1","0"]},
-      |"fpga":{"name":"fpga","addresses":["5","4","3"]}},
+      |{"gpu":{"name":"gpu","addresses":["0","1","2"]},
+      |"fpga":{"name":"fpga","addresses":["3","4","5"]}},
       |"state":"ALIVE","lastheartbeat":%d}
     """.format(currTimeInMillis).stripMargin
 
   val appDescJsonStr =
     """
-      |{"name":"name","cores":4,"memoryperslave":1234,"resourcesperslave":[],
+      |{"name":"name","cores":4,"memoryperexecutor":1234,"resourcesperexecutor":[],
+      |"memoryperslave":1234,"resourcesperslave":[],
       |"user":"%s","command":"Command(mainClass,List(arg1, arg2),Map(),List(),List(),List())"}
     """.format(System.getProperty("user.name", "<unknown>")).stripMargin
 
@@ -186,4 +235,18 @@ object JsonConstants {
       |"executors":[],
       |"finishedexecutors":[%s,%s]}
     """.format(executorRunnerJsonStr, executorRunnerJsonStr).stripMargin
+
+  val clusterUtilizationJsonStr =
+    """
+      |{"waitingDrivers":1,
+      |"cores":8,"coresused":0,"coresutilization":0,
+      |"memory":2468,"memoryused":0,"memoryutilization":0}
+    """.stripMargin
+
+  val clusterUtilizationWithoutWorkersJsonStr =
+    """
+      |{"waitingDrivers":1,
+      |"cores":0,"coresused":0,"coresutilization":100,
+      |"memory":0,"memoryused":0,"memoryutilization":100}
+    """.stripMargin
 }

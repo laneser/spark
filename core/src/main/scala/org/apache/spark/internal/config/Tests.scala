@@ -26,11 +26,11 @@ private[spark] object Tests {
     .longConf
     .createWithDefault(Runtime.getRuntime.maxMemory)
 
-  val TEST_SCHEDULE_INTERVAL =
-    ConfigBuilder("spark.testing.dynamicAllocation.scheduleInterval")
-      .version("2.3.0")
-      .longConf
-      .createWithDefault(100)
+  val TEST_DYNAMIC_ALLOCATION_SCHEDULE_ENABLED =
+    ConfigBuilder("spark.testing.dynamicAllocation.schedule.enabled")
+      .version("3.1.0")
+      .booleanConf
+      .createWithDefault(true)
 
   val IS_TESTING = ConfigBuilder("spark.testing")
     .version("1.0.1")
@@ -82,5 +82,14 @@ private[spark] object Tests {
       .version("3.1.0")
       .booleanConf
       .createWithDefault(false)
+
+  val TEST_SKIP_ESS_REGISTER = ConfigBuilder("spark.testing.skipESSRegister")
+    .version("4.0.0")
+    .doc("None of Spark testing modes (local, local-cluster) enables shuffle service. So it is " +
+      s"hard to test ${SHUFFLE_SERVICE_ENABLED.key} when you only want to test this flag but " +
+      s"without the real server. This config provides a way to allow tests run with " +
+      s"${SHUFFLE_SERVICE_ENABLED.key} enabled without registration failures.")
+    .booleanConf
+    .createWithDefault(false)
 
 }

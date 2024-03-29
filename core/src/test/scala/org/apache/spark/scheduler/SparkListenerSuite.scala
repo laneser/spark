@@ -18,13 +18,15 @@
 package org.apache.spark.scheduler
 
 import java.io.{Externalizable, ObjectInput, ObjectOutput}
+import java.util.{Collections, IdentityHashMap}
 import java.util.concurrent.Semaphore
 
-import scala.collection.JavaConverters._
 import scala.collection.mutable
+import scala.jdk.CollectionConverters._
 
 import org.mockito.Mockito
-import org.scalatest.Matchers
+import org.scalatest.matchers.must.Matchers
+import org.scalatest.matchers.should.Matchers._
 
 import org.apache.spark._
 import org.apache.spark.executor.TaskMetrics
@@ -288,6 +290,19 @@ class SparkListenerSuite extends SparkFunSuite with LocalSparkContext with Match
     stageInfo.rddInfos.forall(_.numPartitions == 4) should be {true}
   }
 
+  test("SPARK-46383: Track TaskInfo objects") {
+    // Test that the same TaskInfo object is sent to the `DAGScheduler` in the `onTaskStart` and
+    // `onTaskEnd` events.
+    val conf = new SparkConf().set(DROP_TASK_INFO_ACCUMULABLES_ON_TASK_COMPLETION, true)
+    sc = new SparkContext("local", "SparkListenerSuite", conf)
+    val listener = new SaveActiveTaskInfos
+    sc.addSparkListener(listener)
+    val rdd1 = sc.parallelize(1 to 100, 4)
+    sc.runJob(rdd1, (items: Iterator[Int]) => items.size, Seq(0, 1))
+    sc.listenerBus.waitUntilEmpty()
+    listener.taskInfos.size should be { 0 }
+  }
+
   test("local metrics") {
     sc = new SparkContext("local", "SparkListenerSuite")
     val listener = new SaveStageAndTaskInfo
@@ -327,10 +342,10 @@ class SparkListenerSuite extends SparkFunSuite with LocalSparkContext with Match
        */
       checkNonZeroAvg(
         taskInfoMetrics.map(_._2.executorRunTime),
-        stageInfo + " executorRunTime")
+        stageInfo.toString + " executorRunTime")
       checkNonZeroAvg(
         taskInfoMetrics.map(_._2.executorDeserializeTime),
-        stageInfo + " executorDeserializeTime")
+        stageInfo.toString + " executorDeserializeTime")
 
       /* Test is disabled (SEE SPARK-2208)
       if (stageInfo.rddInfos.exists(_.name == d4.name)) {
@@ -570,9 +585,9 @@ class SparkListenerSuite extends SparkFunSuite with LocalSparkContext with Match
     }
   }
 
-  test("event queue size can be configued through spark conf") {
+  test("event queue size can be configured through spark conf") {
     // configure the shared queue size to be 1, event log queue size to be 2,
-    // and listner bus event queue size to be 5
+    // and listener bus event queue size to be 5
     val conf = new SparkConf(false)
       .set(LISTENER_BUS_EVENT_QUEUE_CAPACITY, 5)
       .set(s"spark.scheduler.listenerbus.eventqueue.${SHARED_QUEUE}.capacity", "1")
@@ -592,10 +607,26 @@ class SparkListenerSuite extends SparkFunSuite with LocalSparkContext with Match
     // check the size of shared queue is 1 as configured
     assert(bus.getQueueCapacity(SHARED_QUEUE) == Some(1))
     // no specific size of status queue is configured,
-    // it shoud use the LISTENER_BUS_EVENT_QUEUE_CAPACITY
+    // it should use the LISTENER_BUS_EVENT_QUEUE_CAPACITY
     assert(bus.getQueueCapacity(APP_STATUS_QUEUE) == Some(5))
     // check the size of event log queue is 5 as configured
     assert(bus.getQueueCapacity(EVENT_LOG_QUEUE) == Some(2))
+  }
+
+  test("SPARK-39973: Suppress error logs when the number of timers is set to 0") {
+    sc = new SparkContext(
+      "local",
+      "SparkListenerSuite",
+      new SparkConf().set(
+        LISTENER_BUS_METRICS_MAX_LISTENER_CLASSES_TIMED.key, 0.toString))
+    val testAppender = new LogAppender("Error logger for timers")
+    withLogAppender(testAppender) {
+      sc.addSparkListener(new SparkListener { })
+      sc.addSparkListener(new SparkListener { })
+    }
+    assert(!testAppender.loggingEvents
+      .exists(_.getMessage.getFormattedMessage.contains(
+        "Not measuring processing time for listener")))
   }
 
   /**
@@ -621,8 +652,29 @@ class SparkListenerSuite extends SparkFunSuite with LocalSparkContext with Match
     }
 
     override def onStageCompleted(stage: SparkListenerStageCompleted): Unit = {
-      stageInfos(stage.stageInfo) = taskInfoMetrics
+      stageInfos(stage.stageInfo) = taskInfoMetrics.toSeq
       taskInfoMetrics = mutable.Buffer.empty
+    }
+  }
+
+  /**
+   * A simple listener that tracks task infos for all active tasks.
+   */
+  private class SaveActiveTaskInfos extends SparkListener {
+    // Use a set based on IdentityHashMap instead of a HashSet to track unique references of
+    // TaskInfo objects.
+    val taskInfos = Collections.newSetFromMap[TaskInfo](new IdentityHashMap)
+
+    override def onTaskStart(taskStart: SparkListenerTaskStart): Unit = {
+      val info = taskStart.taskInfo
+      if (info != null) {
+        taskInfos.add(info)
+      }
+    }
+
+    override def onTaskEnd(task: SparkListenerTaskEnd): Unit = {
+      val info = task.taskInfo
+      taskInfos.remove(info)
     }
   }
 

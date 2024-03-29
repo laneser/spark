@@ -76,13 +76,15 @@ class UnionRDD[T: ClassTag](
 
   override def getPartitions: Array[Partition] = {
     val parRDDs = if (isPartitionListingParallel) {
+      // scalastyle:off parvector
       val parArray = new ParVector(rdds.toVector)
       parArray.tasksupport = UnionRDD.partitionEvalTaskSupport
+      // scalastyle:on parvector
       parArray
     } else {
       rdds
     }
-    val array = new Array[Partition](parRDDs.map(_.partitions.length).sum)
+    val array = new Array[Partition](parRDDs.iterator.map(_.partitions.length).sum)
     var pos = 0
     for ((rdd, rddIndex) <- rdds.zipWithIndex; split <- rdd.partitions) {
       array(pos) = new UnionPartition(pos, rdd, rddIndex, split.index)
@@ -98,7 +100,7 @@ class UnionRDD[T: ClassTag](
       deps += new RangeDependency(rdd, 0, pos, rdd.partitions.length)
       pos += rdd.partitions.length
     }
-    deps
+    deps.toSeq
   }
 
   override def compute(s: Partition, context: TaskContext): Iterator[T] = {

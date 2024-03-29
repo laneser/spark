@@ -311,7 +311,7 @@ abstract class DStream[T: ClassTag] (
   /** Checks whether the 'time' is valid wrt slideDuration for generating RDD */
   private[streaming] def isTimeValid(time: Time): Boolean = {
     if (!isInitialized) {
-      throw new SparkException (this + " has not been initialized")
+      throw new SparkException (this.toString + " has not been initialized")
     } else if (time <= zeroTime || ! (time - zeroTime).isMultipleOf(slideDuration)) {
       logInfo(s"Time $time is invalid as zeroTime is $zeroTime" +
         s" , slideDuration is $slideDuration and difference is ${time - zeroTime}")
@@ -552,7 +552,7 @@ abstract class DStream[T: ClassTag] (
    * Return a new DStream by applying a function to all elements of this DStream,
    * and then flattening the results
    */
-  def flatMap[U: ClassTag](flatMapFunc: T => TraversableOnce[U]): DStream[U] = ssc.withScope {
+  def flatMap[U: ClassTag](flatMapFunc: T => IterableOnce[U]): DStream[U] = ssc.withScope {
     new FlatMappedDStream(this, context.sparkContext.clean(flatMapFunc))
   }
 
@@ -878,7 +878,7 @@ abstract class DStream[T: ClassTag] (
    */
   def slice(fromTime: Time, toTime: Time): Seq[RDD[T]] = ssc.withScope {
     if (!isInitialized) {
-      throw new SparkException(this + " has not been initialized")
+      throw new SparkException(this.toString + " has not been initialized")
     }
 
     val alignedToTime = if ((toTime - zeroTime).isMultipleOf(slideDuration)) {
@@ -960,7 +960,7 @@ object DStream {
   /** Get the creation site of a DStream from the stack trace of when the DStream is created. */
   private[streaming] def getCreationSite(): CallSite = {
     /** Filtering function that excludes non-user classes for a streaming application */
-    def streamingExclustionFunction(className: String): Boolean = {
+    def streamingExclusionFunction(className: String): Boolean = {
       def doesMatch(r: Regex): Boolean = r.findFirstIn(className).isDefined
       val isSparkClass = doesMatch(SPARK_CLASS_REGEX)
       val isSparkExampleClass = doesMatch(SPARK_EXAMPLES_CLASS_REGEX)
@@ -972,6 +972,6 @@ object DStream {
       // non-Spark and non-Scala class, as the rest would streaming application classes.
       (isSparkClass || isScalaClass) && !isSparkExampleClass && !isSparkStreamingTestClass
     }
-    org.apache.spark.util.Utils.getCallSite(streamingExclustionFunction)
+    org.apache.spark.util.Utils.getCallSite(streamingExclusionFunction)
   }
 }

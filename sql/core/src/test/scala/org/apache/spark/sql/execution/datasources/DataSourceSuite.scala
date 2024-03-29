@@ -17,12 +17,17 @@
 
 package org.apache.spark.sql.execution.datasources
 
+import java.io.File
+import java.net.URI
+import java.util.UUID
+
 import org.apache.hadoop.conf.Configuration
 import org.apache.hadoop.fs.{FileStatus, Path, RawLocalFileSystem}
 import org.scalatest.PrivateMethodTester
 
 import org.apache.spark.sql.AnalysisException
 import org.apache.spark.sql.test.SharedSparkSession
+import org.apache.spark.util.Utils
 
 class DataSourceSuite extends SharedSparkSession with PrivateMethodTester {
   import TestPaths._
@@ -37,7 +42,8 @@ class DataSourceSuite extends SharedSparkSession with PrivateMethodTester {
       ),
       hadoopConf,
       checkEmptyGlobPath = true,
-      checkFilesExist = true
+      checkFilesExist = true,
+      enableGlobbing = true
     )
 
     assert(resultPaths.toSet === allPathsInFs.toSet)
@@ -51,7 +57,8 @@ class DataSourceSuite extends SharedSparkSession with PrivateMethodTester {
       ),
       hadoopConf,
       checkEmptyGlobPath = true,
-      checkFilesExist = true
+      checkFilesExist = true,
+      enableGlobbing = true
     )
 
     assert(
@@ -72,7 +79,8 @@ class DataSourceSuite extends SharedSparkSession with PrivateMethodTester {
       ),
       hadoopConf,
       checkEmptyGlobPath = true,
-      checkFilesExist = true
+      checkFilesExist = true,
+      enableGlobbing = true
     )
 
     assert(
@@ -92,7 +100,8 @@ class DataSourceSuite extends SharedSparkSession with PrivateMethodTester {
       ),
       hadoopConf,
       checkEmptyGlobPath = true,
-      checkFilesExist = false
+      checkFilesExist = false,
+      enableGlobbing = true
     )
 
     assert(
@@ -105,17 +114,22 @@ class DataSourceSuite extends SharedSparkSession with PrivateMethodTester {
   }
 
   test("test non existent paths") {
-    assertThrows[AnalysisException](
-      DataSource.checkAndGlobPathIfNecessary(
-        Seq(
-          path1.toString,
-          path2.toString,
-          nonExistentPath.toString
-        ),
-        hadoopConf,
-        checkEmptyGlobPath = true,
-        checkFilesExist = true
-      )
+    checkError(
+      exception = intercept[AnalysisException](
+        DataSource.checkAndGlobPathIfNecessary(
+          Seq(
+            path1.toString,
+            path2.toString,
+            nonExistentPath.toString
+          ),
+          hadoopConf,
+          checkEmptyGlobPath = true,
+          checkFilesExist = true,
+          enableGlobbing = true
+        )
+      ),
+      errorClass = "PATH_NOT_FOUND",
+      parameters = Map("path" -> nonExistentPath.toString)
     )
   }
 
@@ -129,21 +143,69 @@ class DataSourceSuite extends SharedSparkSession with PrivateMethodTester {
         ),
         hadoopConf,
         checkEmptyGlobPath = true,
-        checkFilesExist = true
+        checkFilesExist = true,
+        enableGlobbing = true
       )
     )
   }
 
   test("Data source options should be propagated in method checkAndGlobPathIfNecessary") {
-    val dataSourceOptions = Map("fs.defaultFS" -> "nonexistsFs://nonexistsFs")
+    val dataSourceOptions = Map("fs.defaultFS" -> "nonexistentFs://nonexistentFs")
     val dataSource = DataSource(spark, "parquet", Seq("/path3"), options = dataSourceOptions)
-    val checkAndGlobPathIfNecessary = PrivateMethod[Seq[Path]]('checkAndGlobPathIfNecessary)
+    val checkAndGlobPathIfNecessary =
+      PrivateMethod[Seq[Path]](Symbol("checkAndGlobPathIfNecessary"))
 
     val message = intercept[java.io.IOException] {
       dataSource invokePrivate checkAndGlobPathIfNecessary(false, false)
     }.getMessage
-    val expectMessage = "No FileSystem for scheme nonexistsFs"
+    val expectMessage = "No FileSystem for scheme nonexistentFs"
     assert(message.filterNot(Set(':', '"').contains) == expectMessage)
+  }
+
+  test("SPARK-13774: Check error message for non existent path without globbed paths") {
+    val uuid = UUID.randomUUID().toString
+    val baseDir = Utils.createTempDir()
+    checkError(
+      exception = intercept[AnalysisException] {
+        spark.read.format("csv").load(
+          new File(baseDir, "file").getAbsolutePath,
+          new File(baseDir, "file2").getAbsolutePath,
+          new File(uuid, "file3").getAbsolutePath,
+          uuid).rdd
+      },
+      errorClass = "PATH_NOT_FOUND",
+      parameters = Map("path" -> "file:.*"),
+      matchPVals = true
+    )
+  }
+
+  test("SPARK-13774: Check error message for not existent globbed paths") {
+    // Non-existent initial path component:
+    val nonExistentBasePath = "/" + UUID.randomUUID().toString
+    assert(!new File(nonExistentBasePath).exists())
+    checkError(
+      exception = intercept[AnalysisException] {
+        spark.read.format("text").load(s"$nonExistentBasePath/*")
+      },
+      errorClass = "PATH_NOT_FOUND",
+      parameters = Map("path" -> s"file:$nonExistentBasePath/*")
+    )
+
+    // Existent initial path component, but no matching files:
+    val baseDir = Utils.createTempDir()
+    val childDir = Utils.createTempDir(baseDir.getAbsolutePath)
+    assert(childDir.exists())
+    try {
+      checkError(
+        exception = intercept[AnalysisException] {
+          spark.read.json(s"${baseDir.getAbsolutePath}/*/*-xyz.json").rdd
+        },
+        errorClass = "PATH_NOT_FOUND",
+        parameters = Map("path" -> s"file:${baseDir.getAbsolutePath}/*/*-xyz.json")
+      )
+    } finally {
+      Utils.deleteRecursively(baseDir)
+    }
   }
 }
 
@@ -203,4 +265,6 @@ class MockFileSystem extends RawLocalFileSystem {
   override def globStatus(pathPattern: Path): Array[FileStatus] = {
     mockGlobResults.getOrElse(pathPattern, Array())
   }
+
+  override def getUri: URI = URI.create("mockFs://mockFs/")
 }

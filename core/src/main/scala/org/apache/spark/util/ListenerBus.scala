@@ -19,7 +19,7 @@ package org.apache.spark.util
 
 import java.util.concurrent.CopyOnWriteArrayList
 
-import scala.collection.JavaConverters._
+import scala.jdk.CollectionConverters._
 import scala.reflect.ClassTag
 import scala.util.control.NonFatal
 
@@ -27,6 +27,8 @@ import com.codahale.metrics.Timer
 
 import org.apache.spark.SparkEnv
 import org.apache.spark.internal.{config, Logging}
+import org.apache.spark.scheduler.EventLoggingListener
+import org.apache.spark.scheduler.SparkListenerEnvironmentUpdate
 
 /**
  * An event bus which posts events to its listeners.
@@ -97,7 +99,7 @@ private[spark] trait ListenerBus[L <: AnyRef, E] extends Logging {
    * `postToAll` in the same thread for all events.
    */
   def postToAll(event: E): Unit = {
-    // JavaConverters can create a JIterableWrapper if we use asScala.
+    // CollectionConverters can create a JIterableWrapper if we use asScala.
     // However, this method will be called frequently. To avoid the wrapper cost, here we use
     // Java Iterator directly.
     val iter = listenersPlusTimers.iterator
@@ -128,7 +130,7 @@ private[spark] trait ListenerBus[L <: AnyRef, E] extends Logging {
         if (maybeTimerContext != null) {
           val elapsed = maybeTimerContext.stop()
           if (logSlowEventEnabled && elapsed > logSlowEventThreshold) {
-            logInfo(s"Process of event ${event} by listener ${listenerName} took " +
+            logInfo(s"Process of event ${redactEvent(event)} by listener ${listenerName} took " +
               s"${elapsed / 1000000000d}s.")
           }
         }
@@ -148,6 +150,14 @@ private[spark] trait ListenerBus[L <: AnyRef, E] extends Logging {
   private[spark] def findListenersByClass[T <: L : ClassTag](): Seq[T] = {
     val c = implicitly[ClassTag[T]].runtimeClass
     listeners.asScala.filter(_.getClass == c).map(_.asInstanceOf[T]).toSeq
+  }
+
+  private def redactEvent(e: E): E = {
+    e match {
+      case event: SparkListenerEnvironmentUpdate =>
+        EventLoggingListener.redactEvent(env.conf, event).asInstanceOf[E]
+      case _ => e
+    }
   }
 
 }

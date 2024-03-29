@@ -26,6 +26,7 @@ import org.apache.spark.ml.param.shared._
 import org.apache.spark.ml.util._
 import org.apache.spark.sql.Dataset
 import org.apache.spark.sql.types.StructType
+import org.apache.spark.util.ArrayImplicits._
 
 /**
  * Params for [[QuantileDiscretizer]].
@@ -46,7 +47,6 @@ private[feature] trait QuantileDiscretizerBase extends Params
   val numBuckets = new IntParam(this, "numBuckets", "Number of buckets (quantiles, or " +
     "categories) into which data points are grouped. Must be >= 2.",
     ParamValidators.gtEq(2))
-  setDefault(numBuckets -> 2)
 
   /** @group getParam */
   def getNumBuckets: Int = getOrDefault(numBuckets)
@@ -82,7 +82,8 @@ private[feature] trait QuantileDiscretizerBase extends Params
     "how to handle invalid entries. Options are skip (filter out rows with invalid values), " +
     "error (throw an error), or keep (keep invalid values in a special additional bucket).",
     ParamValidators.inArray(Bucketizer.supportedHandleInvalids))
-  setDefault(handleInvalid, Bucketizer.ERROR_INVALID)
+
+  setDefault(handleInvalid -> Bucketizer.ERROR_INVALID, numBuckets -> 2)
 }
 
 /**
@@ -179,7 +180,7 @@ final class QuantileDiscretizer @Since("1.6.0") (@Since("1.6.0") override val ui
     }
 
     val (inputColNames, outputColNames) = if (isSet(inputCols)) {
-      ($(inputCols).toSeq, $(outputCols).toSeq)
+      ($(inputCols).toImmutableArraySeq, $(outputCols).toImmutableArraySeq)
     } else {
       (Seq($(inputCol)), Seq($(outputCol)))
     }
@@ -243,7 +244,7 @@ final class QuantileDiscretizer @Since("1.6.0") (@Since("1.6.0") override val ui
     // non-deterministic results when array contains both 0.0 and -0.0
     // So that here we should first normalize all 0.0 and -0.0 to be 0.0
     // See https://github.com/scala/bug/issues/11995
-    for (i <- 0 until splits.length) {
+    for (i <- splits.indices) {
       if (splits(i) == -0.0) {
         splits(i) = 0.0
       }

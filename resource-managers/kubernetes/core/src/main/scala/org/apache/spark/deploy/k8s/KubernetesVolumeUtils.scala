@@ -16,6 +16,8 @@
  */
 package org.apache.spark.deploy.k8s
 
+import java.lang.Long.parseLong
+
 import org.apache.spark.SparkConf
 import org.apache.spark.deploy.k8s.Config._
 
@@ -38,7 +40,7 @@ private[spark] object KubernetesVolumeUtils {
       KubernetesVolumeSpec(
         volumeName = volumeName,
         mountPath = properties(pathKey),
-        mountSubPath = properties.get(subPathKey).getOrElse(""),
+        mountSubPath = properties.getOrElse(subPathKey, ""),
         mountReadOnly = properties.get(readOnlyKey).exists(_.toBoolean),
         volumeConf = parseVolumeSpecificConf(properties, volumeType, volumeName))
     }.toSeq
@@ -67,26 +69,53 @@ private[spark] object KubernetesVolumeUtils {
     volumeType match {
       case KUBERNETES_VOLUMES_HOSTPATH_TYPE =>
         val pathKey = s"$volumeType.$volumeName.$KUBERNETES_VOLUMES_OPTIONS_PATH_KEY"
+        verifyOptionKey(options, pathKey, KUBERNETES_VOLUMES_HOSTPATH_TYPE)
         KubernetesHostPathVolumeConf(options(pathKey))
 
       case KUBERNETES_VOLUMES_PVC_TYPE =>
         val claimNameKey = s"$volumeType.$volumeName.$KUBERNETES_VOLUMES_OPTIONS_CLAIM_NAME_KEY"
-        KubernetesPVCVolumeConf(options(claimNameKey))
+        val storageClassKey =
+          s"$volumeType.$volumeName.$KUBERNETES_VOLUMES_OPTIONS_CLAIM_STORAGE_CLASS_KEY"
+        val sizeLimitKey = s"$volumeType.$volumeName.$KUBERNETES_VOLUMES_OPTIONS_SIZE_LIMIT_KEY"
+        verifyOptionKey(options, claimNameKey, KUBERNETES_VOLUMES_PVC_TYPE)
+        verifySize(options.get(sizeLimitKey))
+        KubernetesPVCVolumeConf(
+          options(claimNameKey),
+          options.get(storageClassKey),
+          options.get(sizeLimitKey))
 
       case KUBERNETES_VOLUMES_EMPTYDIR_TYPE =>
         val mediumKey = s"$volumeType.$volumeName.$KUBERNETES_VOLUMES_OPTIONS_MEDIUM_KEY"
         val sizeLimitKey = s"$volumeType.$volumeName.$KUBERNETES_VOLUMES_OPTIONS_SIZE_LIMIT_KEY"
+        verifySize(options.get(sizeLimitKey))
         KubernetesEmptyDirVolumeConf(options.get(mediumKey), options.get(sizeLimitKey))
 
       case KUBERNETES_VOLUMES_NFS_TYPE =>
         val pathKey = s"$volumeType.$volumeName.$KUBERNETES_VOLUMES_OPTIONS_PATH_KEY"
         val serverKey = s"$volumeType.$volumeName.$KUBERNETES_VOLUMES_OPTIONS_SERVER_KEY"
+        verifyOptionKey(options, pathKey, KUBERNETES_VOLUMES_NFS_TYPE)
+        verifyOptionKey(options, serverKey, KUBERNETES_VOLUMES_NFS_TYPE)
         KubernetesNFSVolumeConf(
           options(pathKey),
           options(serverKey))
 
       case _ =>
         throw new IllegalArgumentException(s"Kubernetes Volume type `$volumeType` is not supported")
+    }
+  }
+
+  private def verifyOptionKey(options: Map[String, String], key: String, msg: String): Unit = {
+    if (!options.isDefinedAt(key)) {
+      throw new NoSuchElementException(key + s" is required for $msg")
+    }
+  }
+
+  private def verifySize(size: Option[String]): Unit = {
+    size.foreach { v =>
+      if (v.forall(_.isDigit) && parseLong(v) < 1024) {
+        throw new IllegalArgumentException(
+          s"Volume size `$v` is smaller than 1KiB. Missing units?")
+      }
     }
   }
 }

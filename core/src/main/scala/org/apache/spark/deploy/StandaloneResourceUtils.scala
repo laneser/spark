@@ -23,12 +23,13 @@ import java.nio.file.Files
 import scala.collection.mutable
 import scala.util.control.NonFatal
 
-import org.json4s.{DefaultFormats, Extraction}
+import org.json4s.{DefaultFormats, Extraction, Formats}
 import org.json4s.jackson.JsonMethods.{compact, render}
 
 import org.apache.spark.SparkException
 import org.apache.spark.internal.Logging
 import org.apache.spark.resource.{ResourceAllocation, ResourceID, ResourceInformation, ResourceRequirement}
+import org.apache.spark.util.ArrayImplicits._
 import org.apache.spark.util.Utils
 
 private[spark] object StandaloneResourceUtils extends Logging {
@@ -96,10 +97,10 @@ private[spark] object StandaloneResourceUtils extends Logging {
     val compShortName = componentName.substring(componentName.lastIndexOf(".") + 1)
     val tmpFile = Utils.tempFileWith(dir)
     val allocations = resources.map { case (rName, rInfo) =>
-      ResourceAllocation(new ResourceID(componentName, rName), rInfo.addresses)
+      ResourceAllocation(new ResourceID(componentName, rName), rInfo.addresses.toImmutableArraySeq)
     }.toSeq
     try {
-      writeResourceAllocationJson(componentName, allocations, tmpFile)
+      writeResourceAllocationJson(allocations, tmpFile)
     } catch {
       case NonFatal(e) =>
         val errMsg = s"Exception threw while preparing resource file for $compShortName"
@@ -112,10 +113,9 @@ private[spark] object StandaloneResourceUtils extends Logging {
   }
 
   private def writeResourceAllocationJson[T](
-      componentName: String,
       allocations: Seq[T],
       jsonFile: File): Unit = {
-    implicit val formats = DefaultFormats
+    implicit val formats: Formats = DefaultFormats
     val allocationJson = Extraction.decompose(allocations)
     Files.write(jsonFile.toPath, compact(render(allocationJson)).getBytes())
   }
@@ -149,11 +149,11 @@ private[spark] object StandaloneResourceUtils extends Logging {
 
   // used for UI
   def formatResourcesUsed(
-      resourcesTotal: Map[String, ResourceInformation],
-      resourcesUsed: Map[String, ResourceInformation]): String = {
-    resourcesTotal.map { case (rName, rInfo) =>
-      val used = resourcesUsed(rName).addresses.length
-      val total = rInfo.addresses.length
+      resourcesTotal: Map[String, Int],
+      resourcesUsed: Map[String, Int]): String = {
+    resourcesTotal.map { case (rName, totalSize) =>
+      val used = resourcesUsed(rName)
+      val total = totalSize
       s"$used / $total $rName"
     }.mkString(", ")
   }

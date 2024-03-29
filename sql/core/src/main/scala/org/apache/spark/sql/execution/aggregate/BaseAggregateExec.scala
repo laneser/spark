@@ -17,17 +17,24 @@
 
 package org.apache.spark.sql.execution.aggregate
 
-import org.apache.spark.sql.catalyst.expressions.{Attribute, AttributeReference, AttributeSet, NamedExpression}
+import org.apache.spark.SparkException
+import org.apache.spark.sql.catalyst.expressions.{Attribute, AttributeReference, AttributeSet, Expression, NamedExpression}
 import org.apache.spark.sql.catalyst.expressions.aggregate.{AggregateExpression, Final, PartialMerge}
-import org.apache.spark.sql.execution.{ExplainUtils, UnaryExecNode}
+import org.apache.spark.sql.catalyst.plans.physical.{AllTuples, ClusteredDistribution, Distribution, UnspecifiedDistribution}
+import org.apache.spark.sql.execution.{ExplainUtils, PartitioningPreservingUnaryExecNode, UnaryExecNode}
+import org.apache.spark.sql.execution.streaming.StatefulOperatorPartitioning
 
 /**
  * Holds common logic for aggregate operators
  */
-trait BaseAggregateExec extends UnaryExecNode {
+trait BaseAggregateExec extends UnaryExecNode with PartitioningPreservingUnaryExecNode {
+  def requiredChildDistributionExpressions: Option[Seq[Expression]]
+  def isStreaming: Boolean
+  def numShufflePartitions: Option[Int]
   def groupingExpressions: Seq[NamedExpression]
   def aggregateExpressions: Seq[AggregateExpression]
   def aggregateAttributes: Seq[Attribute]
+  def initialInputBufferOffset: Int
   def resultExpressions: Seq[NamedExpression]
 
   override def verboseStringWithOperatorId(): String = {
@@ -81,4 +88,39 @@ trait BaseAggregateExec extends UnaryExecNode {
     // attributes of the child Aggregate, when the child Aggregate contains the subquery in
     // AggregateFunction. See SPARK-31620 for more details.
     AttributeSet(inputAggBufferAttributes.filterNot(child.output.contains))
+
+  override def output: Seq[Attribute] = resultExpressions.map(_.toAttribute)
+
+  override protected def outputExpressions: Seq[NamedExpression] = resultExpressions
+
+  override def requiredChildDistribution: List[Distribution] = {
+    requiredChildDistributionExpressions match {
+      case Some(exprs) if exprs.isEmpty => AllTuples :: Nil
+      case Some(exprs) =>
+        if (isStreaming) {
+          numShufflePartitions match {
+            case Some(parts) =>
+              StatefulOperatorPartitioning.getCompatibleDistribution(
+                exprs, parts, conf) :: Nil
+
+            case _ => throw SparkException.internalError(
+              "Expected to set the number of partitions before " +
+              "constructing required child distribution!")
+          }
+        } else {
+          ClusteredDistribution(exprs) :: Nil
+        }
+      case None => UnspecifiedDistribution :: Nil
+    }
+  }
+
+  /**
+   * The corresponding [[SortAggregateExec]] to get same result as this node.
+   */
+  def toSortAggregate: SortAggregateExec = {
+    SortAggregateExec(
+      requiredChildDistributionExpressions, isStreaming, numShufflePartitions, groupingExpressions,
+      aggregateExpressions, aggregateAttributes, initialInputBufferOffset, resultExpressions,
+      child)
+  }
 }

@@ -16,19 +16,10 @@
  */
 package org.apache.spark.sql.catalyst.parser
 
-import java.io.File
-import java.nio.file.Files
-
-import scala.collection.JavaConverters._
-import scala.collection.mutable
-
-import org.apache.spark.SparkFunSuite
-import org.apache.spark.sql.catalyst.TableIdentifier
-import org.apache.spark.sql.catalyst.plans.SQLHelper
-import org.apache.spark.sql.catalyst.util.fileToString
+import org.apache.spark.sql.catalyst.{SQLKeywordUtils, TableIdentifier}
 import org.apache.spark.sql.internal.SQLConf
 
-class TableIdentifierParserSuite extends SparkFunSuite with SQLHelper {
+class TableIdentifierParserSuite extends SQLKeywordUtils {
   import CatalystSqlParser._
 
   // Add "$elem$", "$value$" & "$key$"
@@ -292,121 +283,6 @@ class TableIdentifierParserSuite extends SparkFunSuite with SQLHelper {
     "where",
     "with")
 
-  private val sqlSyntaxDefs = {
-    val sqlBasePath = {
-      java.nio.file.Paths.get(sparkHome, "sql", "catalyst", "src", "main", "antlr4", "org",
-        "apache", "spark", "sql", "catalyst", "parser", "SqlBase.g4").toFile
-    }
-    fileToString(sqlBasePath).split("\n")
-  }
-
-  private def parseAntlrGrammars[T](startTag: String, endTag: String)
-      (f: PartialFunction[String, Seq[T]]): Set[T] = {
-    val keywords = new mutable.ArrayBuffer[T]
-    val default = (_: String) => Nil
-    var startTagFound = false
-    var parseFinished = false
-    val lineIter = sqlSyntaxDefs.toIterator
-    while (!parseFinished && lineIter.hasNext) {
-      val line = lineIter.next()
-      if (line.trim.startsWith(startTag)) {
-        startTagFound = true
-      } else if (line.trim.startsWith(endTag)) {
-        parseFinished = true
-      } else if (startTagFound) {
-        f.applyOrElse(line, default).foreach { symbol =>
-          keywords += symbol
-        }
-      }
-    }
-    assert(keywords.nonEmpty && startTagFound && parseFinished, "cannot extract keywords from " +
-      s"the `SqlBase.g4` file, so please check if the start/end tags (`$startTag` and `$endTag`) " +
-      "are placed correctly in the file.")
-    keywords.toSet
-  }
-
-  // If a symbol does not have the same string with its literal (e.g., `SETMINUS: 'MINUS';`),
-  // we need to map a symbol to actual literal strings.
-  val symbolsToExpandIntoDifferentLiterals = {
-    val kwDef = """([A-Z_]+):(.+);""".r
-    val keywords = parseAntlrGrammars(
-        "//--SPARK-KEYWORD-LIST-START", "//--SPARK-KEYWORD-LIST-END") {
-      case kwDef(symbol, literalDef) =>
-        val splitDefs = literalDef.split("""\|""")
-        val hasMultipleLiterals = splitDefs.length > 1
-        // The case where a symbol has multiple literal definitions,
-        // e.g., `DATABASES: 'DATABASES' | 'SCHEMAS';`.
-        if (hasMultipleLiterals) {
-          // Filters out inappropriate entries, e.g., `!` in `NOT: 'NOT' | '!';`
-          val litDef = """([A-Z_]+)""".r
-          val literals = splitDefs.map(_.replaceAll("'", "").trim).toSeq.flatMap {
-            case litDef(lit) => Some(lit)
-            case _ => None
-          }
-          (symbol, literals) :: Nil
-        } else {
-          val literal = literalDef.replaceAll("'", "").trim
-          // The case where a symbol string and its literal string are different,
-          // e.g., `SETMINUS: 'MINUS';`.
-          if (symbol != literal) {
-            (symbol, literal :: Nil) :: Nil
-          } else {
-            Nil
-          }
-        }
-    }
-    keywords.toMap
-  }
-
-  // All the SQL keywords defined in `SqlBase.g4`
-  val allCandidateKeywords = {
-    val kwDef = """([A-Z_]+):.+;""".r
-    val keywords = parseAntlrGrammars(
-        "//--SPARK-KEYWORD-LIST-START", "//--SPARK-KEYWORD-LIST-END") {
-      // Parses a pattern, e.g., `AFTER: 'AFTER';`
-      case kwDef(symbol) =>
-        if (symbolsToExpandIntoDifferentLiterals.contains(symbol)) {
-          symbolsToExpandIntoDifferentLiterals(symbol)
-        } else {
-          symbol :: Nil
-        }
-    }
-    keywords
-  }
-
-  val nonReservedKeywordsInAnsiMode = {
-    val kwDef = """\s*[\|:]\s*([A-Z_]+)\s*""".r
-    parseAntlrGrammars("//--ANSI-NON-RESERVED-START", "//--ANSI-NON-RESERVED-END") {
-      // Parses a pattern, e.g., `    | AFTER`
-      case kwDef(symbol) =>
-        if (symbolsToExpandIntoDifferentLiterals.contains(symbol)) {
-          symbolsToExpandIntoDifferentLiterals(symbol)
-        } else {
-          symbol :: Nil
-        }
-    }
-  }
-
-  val reservedKeywordsInAnsiMode = allCandidateKeywords -- nonReservedKeywordsInAnsiMode
-
-  test("check # of reserved keywords") {
-    val numReservedKeywords = 74
-    assert(reservedKeywordsInAnsiMode.size == numReservedKeywords,
-      s"The expected number of reserved keywords is $numReservedKeywords, but " +
-        s"${reservedKeywordsInAnsiMode.size} found.")
-  }
-
-  test("reserved keywords in Spark are also reserved in SQL 2016") {
-    withTempDir { dir =>
-      val tmpFile = new File(dir, "tmp")
-      val is = Thread.currentThread().getContextClassLoader
-        .getResourceAsStream("ansi-sql-2016-reserved-keywords.txt")
-      Files.copy(is, tmpFile.toPath)
-      val reservedKeywordsInSql2016 = Files.readAllLines(tmpFile.toPath)
-        .asScala.filterNot(_.startsWith("--")).map(_.trim).toSet
-      assert((reservedKeywordsInAnsiMode  -- reservedKeywordsInSql2016).isEmpty)
-    }
-  }
 
   test("table identifier") {
     // Regular names.
@@ -414,8 +290,17 @@ class TableIdentifierParserSuite extends SparkFunSuite with SQLHelper {
     assert(TableIdentifier("q", Option("d")) === parseTableIdentifier("d.q"))
 
     // Illegal names.
-    Seq("", "d.q.g", "t:", "${some.var.x}", "tab:1").foreach { identifier =>
-      intercept[ParseException](parseTableIdentifier(identifier))
+    Seq(
+      "" -> ("PARSE_EMPTY_STATEMENT", Map.empty[String, String]),
+      "d.q.g" -> ("PARSE_SYNTAX_ERROR", Map("error" -> "'.'", "hint" -> "")),
+      "t:" -> ("PARSE_SYNTAX_ERROR", Map("error" -> "':'", "hint" -> ": extra input ':'")),
+      "${some.var.x}" -> ("PARSE_SYNTAX_ERROR", Map("error" -> "'$'", "hint" -> "")),
+      "tab:1" -> ("PARSE_SYNTAX_ERROR", Map("error" -> "':'", "hint" -> ""))
+    ).foreach { case (identifier, (errorClass, parameters)) =>
+      checkError(
+        exception = intercept[ParseException](parseTableIdentifier(identifier)),
+        errorClass = errorClass,
+        parameters = parameters)
     }
   }
 
@@ -428,16 +313,26 @@ class TableIdentifierParserSuite extends SparkFunSuite with SQLHelper {
   }
 
   test("table identifier - reserved/non-reserved keywords if ANSI mode enabled") {
-    withSQLConf(SQLConf.ANSI_ENABLED.key -> "true") {
+    withSQLConf(SQLConf.ANSI_ENABLED.key -> "true",
+      SQLConf.ENFORCE_RESERVED_KEYWORDS.key -> "true") {
       reservedKeywordsInAnsiMode.foreach { keyword =>
-        val errMsg = intercept[ParseException] {
-          parseTableIdentifier(keyword)
-        }.getMessage
-        assert(errMsg.contains("no viable alternative at input"))
+        checkError(
+          exception = intercept[ParseException](parseTableIdentifier(keyword)),
+          errorClass = "PARSE_SYNTAX_ERROR",
+          parameters = Map("error" -> s"'$keyword'", "hint" -> ""))
         assert(TableIdentifier(keyword) === parseTableIdentifier(s"`$keyword`"))
         assert(TableIdentifier(keyword, Option("db")) === parseTableIdentifier(s"db.`$keyword`"))
       }
       nonReservedKeywordsInAnsiMode.foreach { keyword =>
+        assert(TableIdentifier(keyword) === parseTableIdentifier(s"$keyword"))
+        assert(TableIdentifier(keyword, Option("db")) === parseTableIdentifier(s"db.$keyword"))
+      }
+    }
+
+    withSQLConf(
+      SQLConf.ANSI_ENABLED.key -> "true",
+      SQLConf.ENFORCE_RESERVED_KEYWORDS.key -> "false") {
+      reservedKeywordsInAnsiMode.foreach { keyword =>
         assert(TableIdentifier(keyword) === parseTableIdentifier(s"$keyword"))
         assert(TableIdentifier(keyword, Option("db")) === parseTableIdentifier(s"db.$keyword"))
       }
@@ -477,8 +372,11 @@ class TableIdentifierParserSuite extends SparkFunSuite with SQLHelper {
     val complexName = TableIdentifier("`weird`table`name", Some("`d`b`1"))
     assert(complexName === parseTableIdentifier("```d``b``1`.```weird``table``name`"))
     assert(complexName === parseTableIdentifier(complexName.quotedString))
-    intercept[ParseException](parseTableIdentifier(complexName.unquotedString))
-    // Table identifier contains countious backticks should be treated correctly.
+    checkError(
+      exception = intercept[ParseException](parseTableIdentifier(complexName.unquotedString)),
+      errorClass = "PARSE_SYNTAX_ERROR",
+      parameters = Map("error" -> "'b'", "hint" -> ""))
+    // Table identifier contains continuous backticks should be treated correctly.
     val complexName2 = TableIdentifier("x``y", Some("d``b"))
     assert(complexName2 === parseTableIdentifier(complexName2.quotedString))
   }

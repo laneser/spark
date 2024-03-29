@@ -182,16 +182,19 @@ final class OneVsRestModel private[ml] (
     if (getPredictionCol.isEmpty && getRawPredictionCol.isEmpty) {
       logWarning(s"$uid: OneVsRestModel.transform() does nothing" +
         " because no output columns were set.")
-      return dataset.toDF
+      return dataset.toDF()
     }
 
-    // determine the input columns: these need to be passed through
-    val origCols = dataset.schema.map(f => col(f.name))
+    val isProbModel = models.head.isInstanceOf[ProbabilisticClassificationModel[_, _]]
+
+    // use a temporary raw prediction column to avoid column conflict
+    val tmpRawPredName = "mbc$raw" + UUID.randomUUID().toString
 
     // add an accumulator column to store predictions of all the models
     val accColName = "mbc$acc" + UUID.randomUUID().toString
-    val initUDF = udf { () => Map[Int, Double]() }
-    val newDataset = dataset.withColumn(accColName, initUDF())
+    val newDataset = dataset.withColumn(accColName, lit(Array.emptyDoubleArray))
+    val columns = newDataset.schema.fieldNames.map(col)
+    val updateUDF = udf { (preds: Array[Double], pred: Vector) => preds :+ pred(1) }
 
     // persist if underlying dataset is not persistent.
     val handlePersistence = !dataset.isStreaming && dataset.storageLevel == StorageLevel.NONE
@@ -200,25 +203,20 @@ final class OneVsRestModel private[ml] (
     }
 
     // update the accumulator column with the result of prediction of models
-    val aggregatedDataset = models.zipWithIndex.foldLeft[DataFrame](newDataset) {
-      case (df, (model, index)) =>
-        val rawPredictionCol = model.getRawPredictionCol
-        val columns = origCols ++ List(col(rawPredictionCol), col(accColName))
+    val aggregatedDataset = models.foldLeft[DataFrame](newDataset) { case (df, model) =>
+      // avoid calling directly setter of model
+      val tmpModel = model.copy(ParamMap.empty).asInstanceOf[ClassificationModel[_, _]]
+      tmpModel.setFeaturesCol($(featuresCol))
+      tmpModel.setRawPredictionCol(tmpRawPredName)
+      tmpModel.setPredictionCol("")
+      if (isProbModel) {
+        tmpModel.asInstanceOf[ProbabilisticClassificationModel[_, _]].setProbabilityCol("")
+      }
 
-        // add temporary column to store intermediate scores and update
-        val tmpColName = "mbc$tmp" + UUID.randomUUID().toString
-        val updateUDF = udf { (predictions: Map[Int, Double], prediction: Vector) =>
-          predictions + ((index, prediction(1)))
-        }
-
-        model.setFeaturesCol($(featuresCol))
-        val transformedDataset = model.transform(df).select(columns: _*)
-        val updatedDataset = transformedDataset
-          .withColumn(tmpColName, updateUDF(col(accColName), col(rawPredictionCol)))
-        val newColumns = origCols ++ List(col(tmpColName))
-
-        // switch out the intermediate column with the accumulator column
-        updatedDataset.select(newColumns: _*).withColumnRenamed(tmpColName, accColName)
+      import org.apache.spark.util.ArrayImplicits._
+      tmpModel.transform(df)
+        .withColumn(accColName, updateUDF(col(accColName), col(tmpRawPredName)))
+        .select(columns.toImmutableArraySeq: _*)
     }
 
     if (handlePersistence) {
@@ -229,15 +227,8 @@ final class OneVsRestModel private[ml] (
     var predictionColumns = Seq.empty[Column]
 
     if (getRawPredictionCol.nonEmpty) {
-      val numClass = models.length
-
       // output the RawPrediction as vector
-      val rawPredictionUDF = udf { predictions: Map[Int, Double] =>
-        val predArray = Array.ofDim[Double](numClass)
-        predictions.foreach { case (idx, value) => predArray(idx) = value }
-        Vectors.dense(predArray)
-      }
-
+      val rawPredictionUDF = udf { preds: Array[Double] => Vectors.dense(preds) }
       predictionColNames :+= getRawPredictionCol
       predictionColumns :+= rawPredictionUDF(col(accColName))
         .as($(rawPredictionCol), outputSchema($(rawPredictionCol)).metadata)
@@ -245,10 +236,7 @@ final class OneVsRestModel private[ml] (
 
     if (getPredictionCol.nonEmpty) {
       // output the index of the classifier with highest confidence as prediction
-      val labelUDF = udf { (predictions: Map[Int, Double]) =>
-        predictions.maxBy(_._2)._1.toDouble
-      }
-
+      val labelUDF = udf { (preds: Array[Double]) => preds.indices.maxBy(preds.apply).toDouble }
       predictionColNames :+= getPredictionCol
       predictionColumns :+= labelUDF(col(accColName))
         .as(getPredictionCol, labelMetadata)

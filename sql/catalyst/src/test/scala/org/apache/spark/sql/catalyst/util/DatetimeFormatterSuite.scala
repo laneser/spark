@@ -19,9 +19,9 @@ package org.apache.spark.sql.catalyst.util
 
 import java.time.DateTimeException
 
-import org.scalatest.Matchers
+import org.scalatest.matchers.must.Matchers
 
-import org.apache.spark.{SparkFunSuite, SparkUpgradeException}
+import org.apache.spark.{SparkFunSuite, SparkIllegalArgumentException, SparkUpgradeException}
 import org.apache.spark.sql.catalyst.plans.SQLHelper
 import org.apache.spark.sql.catalyst.util.DateTimeTestUtils.{date, UTC}
 
@@ -32,7 +32,7 @@ trait DatetimeFormatterSuite extends SparkFunSuite with SQLHelper with Matchers 
 
   private def dateFormatter(
       pattern: String, ldf: LegacyDateFormat = FAST_DATE_FORMAT): DateFormatter = {
-    DateFormatter(pattern, UTC, DateFormatter.defaultLocale, ldf, isParsing = true)
+    DateFormatter(pattern, DateFormatter.defaultLocale, ldf, isParsing = true)
   }
 
   private def timestampFormatter(
@@ -76,9 +76,9 @@ trait DatetimeFormatterSuite extends SparkFunSuite with SQLHelper with Matchers 
 
     Seq(true, false).foreach { isParsing =>
       // not support by the legacy one too
-      val unsupportedBoth = Seq("QQQQQ", "qqqqq", "eeeee", "A", "c", "n", "N", "p", "e")
+      val unsupportedBoth = Seq("QQQQQ", "qqqqq", "eeeee", "A", "B", "c", "n", "N", "p", "e")
       unsupportedBoth.foreach { pattern =>
-        intercept[IllegalArgumentException](checkFormatterCreation(pattern, isParsing))
+        intercept[SparkIllegalArgumentException](checkFormatterCreation(pattern, isParsing))
       }
       // supported by the legacy one, then we will suggest users with SparkUpgradeException
       ((weekBasedLetters ++ unsupportedLetters).map(_.toString)
@@ -90,7 +90,7 @@ trait DatetimeFormatterSuite extends SparkFunSuite with SQLHelper with Matchers 
     // not support by the legacy one too
     val unsupportedBoth = Seq("q", "Q")
     unsupportedBoth.foreach { pattern =>
-      intercept[IllegalArgumentException](checkFormatterCreation(pattern, true))
+      intercept[SparkIllegalArgumentException](checkFormatterCreation(pattern, true))
     }
     // supported by the legacy one, then we will suggest users with SparkUpgradeException
     (unsupportedLettersForParsing.map(_.toString) -- unsupportedBoth).foreach {

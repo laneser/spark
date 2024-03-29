@@ -25,7 +25,7 @@ import org.apache.spark.TestUtils
 import org.apache.spark.scheduler.{SparkListener, SparkListenerTaskEnd}
 import org.apache.spark.sql.DataFrame
 import org.apache.spark.sql.catalyst.TableIdentifier
-import org.apache.spark.sql.execution.SparkPlanInfo
+import org.apache.spark.sql.execution.{SparkPlan, SparkPlanInfo}
 import org.apache.spark.sql.execution.ui.{SparkPlanGraph, SQLAppStatusStore}
 import org.apache.spark.sql.internal.SQLConf.WHOLESTAGE_CODEGEN_ENABLED
 import org.apache.spark.sql.test.SQLTestUtils
@@ -36,7 +36,7 @@ trait SQLMetricsTestUtils extends SQLTestUtils {
 
   protected def currentExecutionIds(): Set[Long] = {
     spark.sparkContext.listenerBus.waitUntilEmpty(10000)
-    statusStore.executionsList.map(_.executionId).toSet
+    statusStore.executionsList().map(_.executionId).toSet
   }
 
   protected def statusStore: SQLAppStatusStore = spark.sharedState.statusStore
@@ -216,8 +216,8 @@ trait SQLMetricsTestUtils extends SQLTestUtils {
       expectedNumOfJobs: Int,
       expectedMetrics: Map[Long, (String, Map[String, Any])],
       enableWholeStage: Boolean = false): Unit = {
-    val expectedMetricsPredicates = expectedMetrics.mapValues { case (nodeName, nodeMetrics) =>
-      (nodeName, nodeMetrics.mapValues(expectedMetricValue =>
+    val expectedMetricsPredicates = expectedMetrics.transform { case (_, (nodeName, nodeMetrics)) =>
+      (nodeName, nodeMetrics.transform((_, expectedMetricValue) =>
         (actualMetricValue: Any) => {
           actualMetricValue.toString.matches(expectedMetricValue.toString)
         }))
@@ -252,6 +252,24 @@ trait SQLMetricsTestUtils extends SQLTestUtils {
             s"$nodeId / '$metricName' (= ${actualMetricsMap(metricName)}) did not match predicate.")
         }
       }
+    }
+  }
+
+  /**
+   * Verify if the metrics in `SparkPlan` operator are same as expected metrics.
+   *
+   * @param plan `SparkPlan` operator to check metrics
+   * @param expectedMetrics the expected metrics. The format is `metric name -> metric value`.
+   */
+  protected def testMetricsInSparkPlanOperator(
+      plan: SparkPlan,
+      expectedMetrics: Map[String, Long]): Unit = {
+    expectedMetrics.foreach { case (metricName: String, metricValue: Long) =>
+      assert(plan.metrics.contains(metricName), s"The query plan should have metric $metricName")
+      val actualMetric = plan.metrics(metricName)
+      assert(actualMetric.value == metricValue,
+        s"The query plan metric $metricName did not match, " +
+          s"expected:$metricValue, actual:${actualMetric.value}")
     }
   }
 }

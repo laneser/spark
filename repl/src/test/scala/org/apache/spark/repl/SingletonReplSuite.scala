@@ -191,7 +191,7 @@ class SingletonReplSuite extends SparkFunSuite {
 
   test("interacting with files") {
     val tempDir = Utils.createTempDir()
-    val out = new FileWriter(tempDir + "/input")
+    val out = new FileWriter(s"$tempDir/input")
     out.write("Hello world!\n")
     out.write("What's up?\n")
     out.write("Goodbye\n")
@@ -344,13 +344,19 @@ class SingletonReplSuite extends SparkFunSuite {
         |}
         |import org.apache.spark.storage.StorageLevel._
         |case class Foo(i: Int)
-        |val ret = sc.parallelize((1 to 100).map(Foo), 10).persist(MEMORY_AND_DISK_2)
-        |ret.count()
-        |val res = sc.getRDDStorageInfo.filter(_.id == ret.id).map(_.numCachedPartitions).sum
+        |val rdd1 = sc.parallelize((1 to 100).map(Foo), 10).persist(MEMORY_ONLY)
+        |val rdd2 = sc.parallelize((1 to 100).map(Foo), 10).persist(MEMORY_ONLY_2)
+        |rdd1.count()
+        |rdd2.count()
+        |val cached1 = sc.getRDDStorageInfo.filter(_.id == rdd1.id).map(_.numCachedPartitions).sum
+        |val size1 = sc.getRDDStorageInfo.filter(_.id == rdd1.id).map(_.memSize).sum
+        |val size2 = sc.getRDDStorageInfo.filter(_.id == rdd2.id).map(_.memSize).sum
+        |assert(size2 == size1 * 2, s"Blocks not replicated properly size1=$size1, size2=$size2")
       """.stripMargin)
     assertDoesNotContain("error:", output)
     assertDoesNotContain("Exception", output)
-    assertContains("res: Int = 10", output)
+    assertContains("cached1: Int = 10", output)
+    assertDoesNotContain("AssertionError", output)
   }
 
   test("should clone and clean line object in ClosureCleaner") {
@@ -377,6 +383,33 @@ class SingletonReplSuite extends SparkFunSuite {
         |  s"deviation too large: $deviation, first size: $cacheSize1, second size: $cacheSize2")
       """.stripMargin)
     assertDoesNotContain("AssertionError", output)
+    assertDoesNotContain("Exception", output)
+  }
+
+  test("newProductSeqEncoder with REPL defined class") {
+    val output = runInterpreter(
+      """
+        |case class Click(id: Int)
+        |spark.implicits.newProductSeqEncoder[Click]
+      """.stripMargin)
+
+    assertDoesNotContain("error:", output)
+    assertDoesNotContain("Exception", output)
+  }
+
+  test("create encoder in executors") {
+    val output = runInterpreter(
+      """
+        |case class Foo(s: String)
+        |
+        |import org.apache.spark.sql.catalyst.encoders.ExpressionEncoder
+        |
+        |val r =
+        |  sc.parallelize(1 to 1).map { i => ExpressionEncoder[Foo](); Foo("bar") }.collect.head
+      """.stripMargin)
+
+    assertContains("r: Foo = Foo(bar)", output)
+    assertDoesNotContain("error:", output)
     assertDoesNotContain("Exception", output)
   }
 
@@ -408,7 +441,9 @@ class SingletonReplSuite extends SparkFunSuite {
         |}
         |val r = sc.parallelize(0 to 2).map(closure).collect
       """.stripMargin)
-    assertContains("r: Array[scala.collection.immutable.IndexedSeq[String]] = " +
+    //  assertContains("r: Array[scala.collection.immutable.IndexedSeq[String]] = " +
+    //    "Array(Vector(), Vector(1someValue), Vector(1someValue, 1someValue, 2someValue))", output)
+    assertContains("r: Array[IndexedSeq[String]] = " +
       "Array(Vector(), Vector(1someValue), Vector(1someValue, 1someValue, 2someValue))", output)
     assertDoesNotContain("Exception", output)
   }
@@ -435,36 +470,11 @@ class SingletonReplSuite extends SparkFunSuite {
         |}
         |val r = sc.parallelize(0 to 2).map(closure).collect
       """.stripMargin)
-    assertContains("r: Array[scala.collection.immutable.IndexedSeq[String]] = " +
-       "Array(Vector(), Vector(1someValue), Vector(1someValue, 1someValue, 2someValue))", output)
+    //  assertContains("r: Array[scala.collection.immutable.IndexedSeq[String]] = " +
+    //    "Array(Vector(), Vector(1someValue), Vector(1someValue, 1someValue, 2someValue))", output)
+    assertContains("r: Array[IndexedSeq[String]] = " +
+      "Array(Vector(), Vector(1someValue), Vector(1someValue, 1someValue, 2someValue))", output)
     assertDoesNotContain("Array(Vector(), Vector(1null), Vector(1null, 1null, 2null)", output)
-    assertDoesNotContain("Exception", output)
-  }
-
-  test("newProductSeqEncoder with REPL defined class") {
-    val output = runInterpreter(
-      """
-        |case class Click(id: Int)
-        |spark.implicits.newProductSeqEncoder[Click]
-      """.stripMargin)
-
-    assertDoesNotContain("error:", output)
-    assertDoesNotContain("Exception", output)
-  }
-
-  test("create encoder in executors") {
-    val output = runInterpreter(
-      """
-        |case class Foo(s: String)
-        |
-        |import org.apache.spark.sql.catalyst.encoders.ExpressionEncoder
-        |
-        |val r =
-        |  sc.parallelize(1 to 1).map { i => ExpressionEncoder[Foo](); Foo("bar") }.collect.head
-      """.stripMargin)
-
-    assertContains("r: Foo = Foo(bar)", output)
-    assertDoesNotContain("error:", output)
     assertDoesNotContain("Exception", output)
   }
 }

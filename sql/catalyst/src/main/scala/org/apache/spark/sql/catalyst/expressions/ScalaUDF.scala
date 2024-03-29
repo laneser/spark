@@ -17,13 +17,15 @@
 
 package org.apache.spark.sql.catalyst.expressions
 
-import org.apache.spark.SparkException
 import org.apache.spark.sql.catalyst.CatalystTypeConverters.{createToCatalystConverter, createToScalaConverter => catalystCreateToScalaConverter, isPrimitive}
 import org.apache.spark.sql.catalyst.InternalRow
 import org.apache.spark.sql.catalyst.encoders.ExpressionEncoder
 import org.apache.spark.sql.catalyst.expressions.codegen._
 import org.apache.spark.sql.catalyst.expressions.codegen.Block._
-import org.apache.spark.sql.types.{AbstractDataType, AnyDataType, DataType, UserDefinedType}
+import org.apache.spark.sql.catalyst.trees.TreePattern.{SCALA_UDF, TreePattern}
+import org.apache.spark.sql.errors.QueryExecutionErrors
+import org.apache.spark.sql.types.{AbstractDataType, AnyDataType, DataType}
+import org.apache.spark.util.Utils
 
 /**
  * User-defined function.
@@ -36,6 +38,8 @@ import org.apache.spark.sql.types.{AbstractDataType, AnyDataType, DataType, User
  * @param inputEncoders ExpressionEncoder for each input parameters. For a input parameter which
  *                      serialized as struct will use encoder instead of CatalystTypeConverters to
  *                      convert internal value to Scala value.
+ * @param outputEncoder ExpressionEncoder for the return type of function. It's only defined when
+ *                      this is a typed Scala UDF.
  * @param udfName  The user-specified name of this UDF.
  * @param nullable  True if the UDF can return null value.
  * @param udfDeterministic  True if the UDF is deterministic. Deterministic UDF returns same result
@@ -46,6 +50,7 @@ case class ScalaUDF(
     dataType: DataType,
     children: Seq[Expression],
     inputEncoders: Seq[Option[ExpressionEncoder[_]]] = Nil,
+    outputEncoder: Option[ExpressionEncoder[_]] = None,
     udfName: Option[String] = None,
     nullable: Boolean = true,
     udfDeterministic: Boolean = true)
@@ -53,7 +58,22 @@ case class ScalaUDF(
 
   override lazy val deterministic: Boolean = udfDeterministic && children.forall(_.deterministic)
 
-  override def toString: String = s"${udfName.getOrElse("UDF")}(${children.mkString(", ")})"
+  // `ScalaUDF` uses `ExpressionEncoder` to convert the function result to Catalyst internal format.
+  // `ExpressionEncoder` is stateful as it reuses the `UnsafeRow` instance, thus `ScalaUDF` is
+  // stateful as well.
+  override def stateful: Boolean = true
+
+  final override val nodePatterns: Seq[TreePattern] = Seq(SCALA_UDF)
+
+  override def toString: String = s"$name(${children.mkString(", ")})"
+
+  override def name: String = udfName.getOrElse("UDF")
+
+  override lazy val canonicalized: Expression = {
+    // SPARK-32307: `ExpressionEncoder` can't be canonicalized, and technically we don't
+    // need it to identify a `ScalaUDF`.
+    copy(children = children.map(_.canonicalized), inputEncoders = Nil, outputEncoder = None)
+  }
 
   /**
    * The analyzer should be aware of Scala primitive types so as to make the
@@ -62,7 +82,7 @@ case class ScalaUDF(
    * Nil(has same effect with all false) and analyzer will skip null-handling
    * on them.
    */
-  def inputPrimitives: Seq[Boolean] = {
+  lazy val inputPrimitives: Seq[Boolean] = {
     inputEncoders.map { encoderOpt =>
       // It's possible that some of the inputs don't have a specific encoder(e.g. `Any`)
       if (encoderOpt.isDefined) {
@@ -103,12 +123,28 @@ case class ScalaUDF(
   }
 
   /**
+   * Create the converter which converts the scala data type to the catalyst data type for
+   * the return data type of udf function. We'd use `ExpressionEncoder` to create the
+   * converter for typed ScalaUDF only, since its the only case where we know the type tag
+   * of the return data type of udf function.
+   */
+  private def catalystConverter: Any => Any = outputEncoder.map { enc =>
+    val toRow = enc.createSerializer().asInstanceOf[Any => Any]
+    if (enc.isSerializedAsStructForTopLevel) {
+      value: Any =>
+        if (value == null) null else toRow(value).asInstanceOf[InternalRow]
+    } else {
+      value: Any =>
+        if (value == null) null else toRow(value).asInstanceOf[InternalRow].get(0, dataType)
+    }
+  }.getOrElse(createToCatalystConverter(dataType))
+
+  /**
    * Create the converter which converts the catalyst data type to the scala data type.
    * We use `CatalystTypeConverters` to create the converter for:
    *   - UDF which doesn't provide inputEncoders, e.g., untyped Scala UDF and Java UDF
    *   - type which isn't supported by `ExpressionEncoder`, e.g., Any
    *   - primitive types, in order to use `identity` for better performance
-   *   - UserDefinedType which isn't fully supported by `ExpressionEncoder`
    * For other cases like case class, Option[T], we use `ExpressionEncoder` instead since
    * `CatalystTypeConverters` doesn't support these data types.
    *
@@ -121,13 +157,14 @@ case class ScalaUDF(
     val useEncoder =
       !(inputEncoders.isEmpty || // for untyped Scala UDF and Java UDF
       inputEncoders(i).isEmpty || // for types aren't supported by encoder, e.g. Any
-      inputPrimitives(i) || // for primitive types
-      dataType.existsRecursively(_.isInstanceOf[UserDefinedType[_]]))
+      inputPrimitives(i)) // for primitive types
 
     if (useEncoder) {
       val enc = inputEncoders(i).get
       val fromRow = enc.createDeserializer()
-      val converter = if (enc.isSerializedAsStructForTopLevel) {
+      val unwrappedValueClass = enc.isSerializedAsStruct &&
+        enc.schema.fields.length == 1 && enc.schema.fields.head.dataType == dataType
+      val converter = if (enc.isSerializedAsStructForTopLevel && !unwrappedValueClass) {
         row: Any => fromRow(row.asInstanceOf[InternalRow])
       } else {
         val inputRow = new GenericInternalRow(1)
@@ -1073,9 +1110,8 @@ case class ScalaUDF(
     val (converters, useEncoders): (Array[Any => Any], Array[Boolean]) =
       (children.zipWithIndex.map { case (c, i) =>
         scalaConverter(i, c.dataType)
-      }.toArray :+ (createToCatalystConverter(dataType), false)).unzip
+      }.toArray :+ (catalystConverter, false)).unzip
     val convertersTerm = ctx.addReferenceObj("converters", converters, s"$converterClassName[]")
-    val errorMsgTerm = ctx.addReferenceObj("errMsg", udfErrorMessage)
     val resultTerm = ctx.freshName("result")
 
     // codegen for children expressions
@@ -1120,7 +1156,7 @@ case class ScalaUDF(
     val resultConverter = s"$convertersTerm[${children.length}]"
     val boxedType = CodeGenerator.boxedType(dataType)
 
-    val funcInvokation = if (isPrimitive(dataType)
+    val funcInvocation = if (isPrimitive(dataType)
         // If the output is nullable, the returned value must be unwrapped from the Option
         && !nullable) {
       s"$resultTerm = ($boxedType)$getFuncResult"
@@ -1131,9 +1167,10 @@ case class ScalaUDF(
       s"""
          |$boxedType $resultTerm = null;
          |try {
-         |  $funcInvokation;
-         |} catch (Exception e) {
-         |  throw new org.apache.spark.SparkException($errorMsgTerm, e);
+         |  $funcInvocation;
+         |} catch (Throwable e) {
+         |  throw QueryExecutionErrors.failedExecuteUserDefinedFunctionError(
+         |    "$functionName", "$inputTypesString", "$outputType", e);
          |}
        """.stripMargin
 
@@ -1151,23 +1188,26 @@ case class ScalaUDF(
        """.stripMargin)
   }
 
-  private[this] val resultConverter = createToCatalystConverter(dataType)
+  private[this] val resultConverter = catalystConverter
 
-  lazy val udfErrorMessage = {
-    val funcCls = function.getClass.getSimpleName
-    val inputTypes = children.map(_.dataType.catalogString).mkString(", ")
-    val outputType = dataType.catalogString
-    s"Failed to execute user defined function($funcCls: ($inputTypes) => $outputType)"
-  }
+  private def functionName = udfName.map { uName => s"$uName ($funcCls)" }.getOrElse(funcCls)
+
+  lazy val funcCls = Utils.getSimpleName(function.getClass)
+  lazy val inputTypesString = children.map(_.dataType.catalogString).mkString(", ")
+  lazy val outputType = dataType.catalogString
 
   override def eval(input: InternalRow): Any = {
     val result = try {
       f(input)
     } catch {
       case e: Exception =>
-        throw new SparkException(udfErrorMessage, e)
+        throw QueryExecutionErrors.failedExecuteUserDefinedFunctionError(
+          functionName, inputTypesString, outputType, e)
     }
 
     resultConverter(result)
   }
+
+  override protected def withNewChildrenInternal(newChildren: IndexedSeq[Expression]): ScalaUDF =
+    copy(children = newChildren)
 }

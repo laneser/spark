@@ -105,12 +105,15 @@ object MLUtils extends Logging {
   }
 
   private[spark] def parseLibSVMFile(
-      sparkSession: SparkSession, paths: Seq[String]): RDD[(Double, Array[Int], Array[Double])] = {
+      sparkSession: SparkSession,
+      paths: Seq[String],
+      options: Map[String, String]): RDD[(Double, Array[Int], Array[Double])] = {
     val lines = sparkSession.baseRelationToDataFrame(
       DataSource.apply(
         sparkSession,
         paths = paths,
-        className = classOf[TextFileFormat].getName
+        className = classOf[TextFileFormat].getName,
+        options = options ++ Map(DataSource.GLOB_PATHS_KEY -> "false")
       ).resolveRelation(checkFilesExist = false))
       .select("value")
 
@@ -144,7 +147,7 @@ object MLUtils extends Logging {
       previous = current
       i += 1
     }
-    (label, indices.toArray, values.toArray)
+    (label, indices, values)
   }
 
   /**
@@ -356,7 +359,8 @@ object MLUtils extends Logging {
         col(c)
       }
     }
-    dataset.select(exprs: _*)
+    import org.apache.spark.util.ArrayImplicits._
+    dataset.select(exprs.toImmutableArraySeq: _*)
   }
 
   /**
@@ -408,7 +412,8 @@ object MLUtils extends Logging {
         col(c)
       }
     }
-    dataset.select(exprs: _*)
+    import org.apache.spark.util.ArrayImplicits._
+    dataset.select(exprs.toImmutableArraySeq: _*)
   }
 
   /**
@@ -458,7 +463,8 @@ object MLUtils extends Logging {
         col(c)
       }
     }
-    dataset.select(exprs: _*)
+    import org.apache.spark.util.ArrayImplicits._
+    dataset.select(exprs.toImmutableArraySeq: _*)
   }
 
   /**
@@ -508,7 +514,8 @@ object MLUtils extends Logging {
         col(c)
       }
     }
-    dataset.select(exprs: _*)
+    import org.apache.spark.util.ArrayImplicits._
+    dataset.select(exprs.toImmutableArraySeq: _*)
   }
 
 
@@ -534,8 +541,10 @@ object MLUtils extends Logging {
       norm2: Double,
       precision: Double = 1e-6): Double = {
     val n = v1.size
-    require(v2.size == n)
-    require(norm1 >= 0.0 && norm2 >= 0.0)
+    require(v2.size == n,
+      s"Both vectors should have same length, found v1 is $n while v2 is ${v2.size}")
+    require(norm1 >= 0.0 && norm2 >= 0.0,
+      s"Both norms should be greater or equal to 0.0, found norm1=$norm1, norm2=$norm2")
     var sqDist = 0.0
     /*
      * The relative error is

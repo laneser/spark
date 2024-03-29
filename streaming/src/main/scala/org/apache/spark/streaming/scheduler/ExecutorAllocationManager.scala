@@ -22,8 +22,10 @@ import scala.util.Random
 
 import org.apache.spark.{ExecutorAllocationClient, SparkConf}
 import org.apache.spark.internal.Logging
+import org.apache.spark.internal.config.DECOMMISSION_ENABLED
 import org.apache.spark.internal.config.Streaming._
 import org.apache.spark.resource.ResourceProfile
+import org.apache.spark.scheduler.ExecutorDecommissionInfo
 import org.apache.spark.streaming.util.RecurringTimer
 import org.apache.spark.util.{Clock, Utils}
 
@@ -126,14 +128,20 @@ private[streaming] class ExecutorAllocationManager(
     logDebug(s"Executors (${allExecIds.size}) = ${allExecIds}")
 
     if (allExecIds.nonEmpty && allExecIds.size > minNumExecutors) {
-      val execIdsWithReceivers = receiverTracker.allocatedExecutors.values.flatten.toSeq
+      val execIdsWithReceivers = receiverTracker.allocatedExecutors().values.flatten.toSeq
       logInfo(s"Executors with receivers (${execIdsWithReceivers.size}): ${execIdsWithReceivers}")
 
       val removableExecIds = allExecIds.diff(execIdsWithReceivers)
       logDebug(s"Removable executors (${removableExecIds.size}): ${removableExecIds}")
       if (removableExecIds.nonEmpty) {
         val execIdToRemove = removableExecIds(Random.nextInt(removableExecIds.size))
-        client.killExecutor(execIdToRemove)
+        if (conf.get(DECOMMISSION_ENABLED)) {
+          client.decommissionExecutor(execIdToRemove,
+            ExecutorDecommissionInfo("spark scale down", None),
+            adjustTargetNumExecutors = true)
+        } else {
+          client.killExecutor(execIdToRemove)
+        }
         logInfo(s"Requested to kill executor $execIdToRemove")
       } else {
         logInfo(s"No non-receiver executors to kill")

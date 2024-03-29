@@ -20,15 +20,15 @@ package org.apache.spark.internal.plugin
 import java.io.File
 import java.nio.charset.StandardCharsets
 import java.util.{Map => JMap}
+import java.util.concurrent.atomic.AtomicInteger
 
-import scala.collection.JavaConverters._
 import scala.concurrent.duration._
+import scala.jdk.CollectionConverters._
 
 import com.codahale.metrics.Gauge
 import com.google.common.io.Files
 import org.mockito.ArgumentMatchers.{any, eq => meq}
 import org.mockito.Mockito.{mock, spy, verify, when}
-import org.scalatest.BeforeAndAfterEach
 import org.scalatest.concurrent.Eventually.{eventually, interval, timeout}
 
 import org.apache.spark._
@@ -36,12 +36,13 @@ import org.apache.spark.TestUtils._
 import org.apache.spark.api.plugin._
 import org.apache.spark.internal.config._
 import org.apache.spark.launcher.SparkLauncher
+import org.apache.spark.memory.MemoryMode
 import org.apache.spark.resource.ResourceInformation
 import org.apache.spark.resource.ResourceUtils.GPU
 import org.apache.spark.resource.TestResourceIDs.{DRIVER_GPU_ID, EXECUTOR_GPU_ID, WORKER_GPU_ID}
 import org.apache.spark.util.Utils
 
-class PluginContainerSuite extends SparkFunSuite with BeforeAndAfterEach with LocalSparkContext {
+class PluginContainerSuite extends SparkFunSuite with LocalSparkContext {
 
   override def afterEach(): Unit = {
     TestSparkPlugin.reset()
@@ -129,6 +130,40 @@ class PluginContainerSuite extends SparkFunSuite with BeforeAndAfterEach with Lo
     assert(TestSparkPlugin.driverPlugin != null)
   }
 
+  test("SPARK-33088: executor tasks trigger plugin calls") {
+    val conf = new SparkConf()
+      .setAppName(getClass().getName())
+      .set(SparkLauncher.SPARK_MASTER, "local[1]")
+      .set(PLUGINS, Seq(classOf[TestSparkPlugin].getName()))
+
+    sc = new SparkContext(conf)
+    sc.parallelize(1 to 10, 2).count()
+
+    assert(TestSparkPlugin.executorPlugin.numOnTaskStart.get() == 2)
+    assert(TestSparkPlugin.executorPlugin.numOnTaskSucceeded.get() == 2)
+    assert(TestSparkPlugin.executorPlugin.numOnTaskFailed.get() == 0)
+  }
+
+  test("SPARK-33088: executor failed tasks trigger plugin calls") {
+    val conf = new SparkConf()
+      .setAppName(getClass().getName())
+      .set(SparkLauncher.SPARK_MASTER, "local[2]")
+      .set(PLUGINS, Seq(classOf[TestSparkPlugin].getName()))
+
+    sc = new SparkContext(conf)
+    try {
+      sc.parallelize(1 to 10, 2).foreach(i => throw new RuntimeException)
+    } catch {
+      case t: Throwable => // ignore exception
+    }
+
+    eventually(timeout(10.seconds), interval(100.millis)) {
+      assert(TestSparkPlugin.executorPlugin.numOnTaskStart.get() == 2)
+      assert(TestSparkPlugin.executorPlugin.numOnTaskSucceeded.get() == 0)
+      assert(TestSparkPlugin.executorPlugin.numOnTaskFailed.get() == 2)
+    }
+  }
+
   test("plugin initialization in non-local mode") {
     val path = Utils.createTempDir()
 
@@ -180,11 +215,11 @@ class PluginContainerSuite extends SparkFunSuite with BeforeAndAfterEach with Lo
       }
       val execFiles =
         children.filter(_.getName.startsWith(NonLocalModeSparkPlugin.executorFileStr))
-      assert(execFiles.size === 1)
+      assert(execFiles.length === 1)
       val allLines = Files.readLines(execFiles(0), StandardCharsets.UTF_8)
       assert(allLines.size === 1)
       val addrs = NonLocalModeSparkPlugin.extractGpuAddrs(allLines.get(0))
-      assert(addrs.size === 2)
+      assert(addrs.length === 2)
       assert(addrs.sorted === Array("3", "4"))
 
       assert(NonLocalModeSparkPlugin.driverContext != null)
@@ -194,6 +229,58 @@ class PluginContainerSuite extends SparkFunSuite with BeforeAndAfterEach with Lo
       assert(driverResources.get(GPU).name === GPU)
     }
   }
+
+  test("memory override in plugin") {
+    val conf = new SparkConf()
+      .setAppName(getClass().getName())
+      .set(SparkLauncher.SPARK_MASTER, "local-cluster[2,1,1024]")
+      .set(PLUGINS, Seq(classOf[MemoryOverridePlugin].getName()))
+
+    var sc: SparkContext = null
+    try {
+      sc = new SparkContext(conf)
+      val memoryManager = sc.env.memoryManager
+
+      assert(memoryManager.tungstenMemoryMode == MemoryMode.OFF_HEAP)
+      assert(memoryManager.maxOffHeapStorageMemory == MemoryOverridePlugin.offHeapMemory)
+
+      // Ensure all executors has started
+      TestUtils.waitUntilExecutorsUp(sc, 1, 60000)
+
+      // Check executor memory is also updated
+      val execInfo = sc.statusTracker.getExecutorInfos.head
+      assert(execInfo.totalOffHeapStorageMemory() == MemoryOverridePlugin.offHeapMemory)
+    } finally {
+      if (sc != null) {
+        sc.stop()
+      }
+    }
+  }
+}
+
+class MemoryOverridePlugin extends SparkPlugin {
+  override def driverPlugin(): DriverPlugin = {
+    new DriverPlugin {
+      override def init(sc: SparkContext, pluginContext: PluginContext): JMap[String, String] = {
+        // Take the original executor memory, and set `spark.memory.offHeap.size` to be the
+        // same value. Also set `spark.memory.offHeap.enabled` to true.
+        val originalExecutorMemBytes =
+          sc.conf.getSizeAsMb(EXECUTOR_MEMORY.key, EXECUTOR_MEMORY.defaultValueString)
+        sc.conf.set(MEMORY_OFFHEAP_ENABLED.key, "true")
+        sc.conf.set(MEMORY_OFFHEAP_SIZE.key, s"${originalExecutorMemBytes}M")
+        MemoryOverridePlugin.offHeapMemory = sc.conf.getSizeAsBytes(MEMORY_OFFHEAP_SIZE.key)
+        Map.empty[String, String].asJava
+      }
+    }
+  }
+
+  override def executorPlugin(): ExecutorPlugin = {
+    new ExecutorPlugin {}
+  }
+}
+
+object MemoryOverridePlugin {
+  var offHeapMemory: Long = _
 }
 
 class NonLocalModeSparkPlugin extends SparkPlugin {
@@ -230,7 +317,7 @@ object NonLocalModeSparkPlugin {
       resources: Map[String, ResourceInformation]): String = {
     // try to keep this simple and only write the gpus addresses, if we add more resources need to
     // make more complex
-    val resourcesString = resources.filterKeys(_.equals(GPU)).map {
+    val resourcesString = resources.filter { case (k, _) => k.equals(GPU) }.map {
       case (_, ri) =>
         s"${ri.addresses.mkString(",")}"
     }.mkString(",")
@@ -273,14 +360,14 @@ class TestSparkPlugin extends SparkPlugin {
   override def driverPlugin(): DriverPlugin = {
     val p = new TestDriverPlugin()
     require(TestSparkPlugin.driverPlugin == null, "Driver plugin already initialized.")
-    TestSparkPlugin.driverPlugin = spy(p)
+    TestSparkPlugin.driverPlugin = spy[TestDriverPlugin](p)
     TestSparkPlugin.driverPlugin
   }
 
   override def executorPlugin(): ExecutorPlugin = {
     val p = new TestExecutorPlugin()
     require(TestSparkPlugin.executorPlugin == null, "Executor plugin already initialized.")
-    TestSparkPlugin.executorPlugin = spy(p)
+    TestSparkPlugin.executorPlugin = spy[TestExecutorPlugin](p)
     TestSparkPlugin.executorPlugin
   }
 
@@ -309,6 +396,10 @@ private class TestDriverPlugin extends DriverPlugin {
 
 private class TestExecutorPlugin extends ExecutorPlugin {
 
+  val numOnTaskStart = new AtomicInteger(0)
+  val numOnTaskSucceeded = new AtomicInteger(0)
+  val numOnTaskFailed = new AtomicInteger(0)
+
   override def init(ctx: PluginContext, extraConf: JMap[String, String]): Unit = {
     ctx.metricRegistry().register("executorMetric", new Gauge[Int] {
       override def getValue(): Int = 84
@@ -316,6 +407,17 @@ private class TestExecutorPlugin extends ExecutorPlugin {
     TestSparkPlugin.executorContext = ctx
   }
 
+  override def onTaskStart(): Unit = {
+    numOnTaskStart.incrementAndGet()
+  }
+
+  override def onTaskSucceeded(): Unit = {
+    numOnTaskSucceeded.incrementAndGet()
+  }
+
+  override def onTaskFailed(failureReason: TaskFailedReason): Unit = {
+    numOnTaskFailed.incrementAndGet()
+  }
 }
 
 private object TestSparkPlugin {

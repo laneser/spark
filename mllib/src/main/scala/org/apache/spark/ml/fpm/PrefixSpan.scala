@@ -135,7 +135,8 @@ final class PrefixSpan(@Since("2.4.0") override val uid: String) extends Params 
   @Since("2.4.0")
   def findFrequentSequentialPatterns(dataset: Dataset[_]): DataFrame = instrumented { instr =>
     instr.logDataset(dataset)
-    instr.logParams(this, params: _*)
+    import org.apache.spark.util.ArrayImplicits._
+    instr.logParams(this, params.toImmutableArraySeq: _*)
 
     val sequenceColParam = $(sequenceCol)
     val inputType = dataset.schema(sequenceColParam).dataType
@@ -146,7 +147,7 @@ final class PrefixSpan(@Since("2.4.0") override val uid: String) extends Params 
 
     val data = dataset.select(sequenceColParam)
     val sequences = data.where(col(sequenceColParam).isNotNull).rdd
-      .map(r => r.getAs[Seq[Seq[Any]]](0).map(_.toArray).toArray)
+      .map(r => r.getSeq[scala.collection.Seq[Any]](0).map(_.toArray).toArray)
 
     val mllibPrefixSpan = new mllibPrefixSpan()
       .setMinSupport($(minSupport))
@@ -154,7 +155,7 @@ final class PrefixSpan(@Since("2.4.0") override val uid: String) extends Params 
       .setMaxLocalProjDBSize($(maxLocalProjDBSize))
 
     val rows = mllibPrefixSpan.run(sequences).freqSequences.map(f => Row(f.sequence, f.freq))
-    val schema = StructType(Seq(
+    val schema = StructType(Array(
       StructField("sequence", dataset.schema(sequenceColParam).dataType, nullable = false),
       StructField("freq", LongType, nullable = false)))
     val freqSequences = dataset.sparkSession.createDataFrame(rows, schema)

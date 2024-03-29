@@ -49,14 +49,14 @@ class KubernetesVolumeUtilsSuite extends SparkFunSuite {
     val sparkConf = new SparkConf(false)
     sparkConf.set("test.persistentVolumeClaim.volumeName.mount.path", "/path")
     sparkConf.set("test.persistentVolumeClaim.volumeName.mount.readOnly", "true")
-    sparkConf.set("test.persistentVolumeClaim.volumeName.options.claimName", "claimeName")
+    sparkConf.set("test.persistentVolumeClaim.volumeName.options.claimName", "claimName")
 
     val volumeSpec = KubernetesVolumeUtils.parseVolumesWithPrefix(sparkConf, "test.").head
     assert(volumeSpec.volumeName === "volumeName")
     assert(volumeSpec.mountPath === "/path")
     assert(volumeSpec.mountReadOnly)
     assert(volumeSpec.volumeConf.asInstanceOf[KubernetesPVCVolumeConf] ===
-      KubernetesPVCVolumeConf("claimeName"))
+      KubernetesPVCVolumeConf("claimName"))
   }
 
   test("Parses emptyDir volumes correctly") {
@@ -118,6 +118,17 @@ class KubernetesVolumeUtilsSuite extends SparkFunSuite {
     assert(e.getMessage.contains("hostPath.volumeName.options.path"))
   }
 
+  test("SPARK-33063: Fails on missing option key in persistentVolumeClaim") {
+    val sparkConf = new SparkConf(false)
+    sparkConf.set("test.persistentVolumeClaim.volumeName.mount.path", "/path")
+    sparkConf.set("test.persistentVolumeClaim.volumeName.mount.readOnly", "true")
+
+    val e = intercept[NoSuchElementException] {
+      KubernetesVolumeUtils.parseVolumesWithPrefix(sparkConf, "test.")
+    }
+    assert(e.getMessage.contains("persistentVolumeClaim.volumeName.options.claimName"))
+  }
+
   test("Parses read-only nfs volumes correctly") {
     val sparkConf = new SparkConf(false)
     sparkConf.set("test.nfs.volumeName.mount.path", "/path")
@@ -170,5 +181,31 @@ class KubernetesVolumeUtilsSuite extends SparkFunSuite {
       KubernetesVolumeUtils.parseVolumesWithPrefix(sparkConf, "test.")
     }
     assert(e.getMessage.contains("nfs.volumeName.options.server"))
+  }
+
+  test("SPARK-47003: Check emptyDir volume size") {
+    val sparkConf = new SparkConf(false)
+    sparkConf.set("test.emptyDir.volumeName.mount.path", "/path")
+    sparkConf.set("test.emptyDir.volumeName.mount.readOnly", "true")
+    sparkConf.set("test.emptyDir.volumeName.options.medium", "medium")
+    sparkConf.set("test.emptyDir.volumeName.options.sizeLimit", "5")
+
+    val m = intercept[IllegalArgumentException] {
+      KubernetesVolumeUtils.parseVolumesWithPrefix(sparkConf, "test.")
+    }.getMessage
+    assert(m.contains("smaller than 1KiB. Missing units?"))
+  }
+
+  test("SPARK-47003: Check persistentVolumeClaim volume size") {
+    val sparkConf = new SparkConf(false)
+    sparkConf.set("test.persistentVolumeClaim.volumeName.mount.path", "/path")
+    sparkConf.set("test.persistentVolumeClaim.volumeName.mount.readOnly", "false")
+    sparkConf.set("test.persistentVolumeClaim.volumeName.options.claimName", "claimName")
+    sparkConf.set("test.persistentVolumeClaim.volumeName.options.sizeLimit", "1000")
+
+    val m = intercept[IllegalArgumentException] {
+      KubernetesVolumeUtils.parseVolumesWithPrefix(sparkConf, "test.")
+    }.getMessage
+    assert(m.contains("smaller than 1KiB. Missing units?"))
   }
 }

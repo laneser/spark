@@ -32,6 +32,7 @@ import org.apache.spark.ml.param._
 import org.apache.spark.ml.param.shared._
 import org.apache.spark.ml.regression.FactorizationMachines._
 import org.apache.spark.ml.util._
+import org.apache.spark.ml.util.DatasetUtils._
 import org.apache.spark.ml.util.Instrumentation.instrumented
 import org.apache.spark.mllib.{linalg => OldLinalg}
 import org.apache.spark.mllib.linalg.{Vector => OldVector, Vectors => OldVectors}
@@ -47,7 +48,7 @@ import org.apache.spark.storage.StorageLevel
  */
 private[ml] trait FactorizationMachinesParams extends PredictorParams
   with HasMaxIter with HasStepSize with HasTol with HasSolver with HasSeed
-  with HasFitIntercept with HasRegParam {
+  with HasFitIntercept with HasRegParam with HasWeightCol {
 
   /**
    * Param for dimensionality of the factors (&gt;= 0)
@@ -112,6 +113,10 @@ private[ml] trait FactorizationMachinesParams extends PredictorParams
     "The solver algorithm for optimization. Supported options: " +
       s"${supportedSolvers.mkString(", ")}. (Default adamW)",
     ParamValidators.inArray[String](supportedSolvers))
+
+  setDefault(factorSize -> 8, fitIntercept -> true, fitLinear -> true, regParam -> 0.0,
+    miniBatchFraction -> 1.0, initStd -> 0.01, maxIter -> 100, stepSize -> 1.0, tol -> 1E-6,
+    solver -> AdamW)
 }
 
 private[ml] trait FactorizationMachines extends FactorizationMachinesParams {
@@ -130,7 +135,7 @@ private[ml] trait FactorizationMachines extends FactorizationMachinesParams {
       data: RDD[(Double, OldVector)],
       numFeatures: Int,
       loss: String
-    ): Vector = {
+    ): (Vector, Array[Double]) = {
 
     // initialize coefficients
     val initialCoefficients = initCoefficients(numFeatures)
@@ -147,8 +152,8 @@ private[ml] trait FactorizationMachines extends FactorizationMachinesParams {
       .setRegParam($(regParam))
       .setMiniBatchFraction($(miniBatchFraction))
       .setConvergenceTol($(tol))
-    val coefficients = optimizer.optimize(data, initialCoefficients)
-    coefficients.asML
+    val (coefficients, lossHistory) = optimizer.optimizeWithLossReturned(data, initialCoefficients)
+    (coefficients.asML, lossHistory)
   }
 }
 
@@ -265,12 +270,13 @@ private[ml] object FactorizationMachines {
 private[regression] trait FMRegressorParams extends FactorizationMachinesParams {
 }
 
+// scalastyle:off line.size.limit
 /**
  * Factorization Machines learning algorithm for regression.
  * It supports normal gradient descent and AdamW solver.
  *
- * The implementation is based upon:
- * <a href="https://www.csie.ntu.edu.tw/~b97053/paper/Rendle2010FM.pdf">
+ * The implementation is based on:
+ * <a href="https://web.archive.org/web/20191225211603/https://www.csie.ntu.edu.tw/~b97053/paper/Rendle2010FM.pdf">
  * S. Rendle. "Factorization machines" 2010</a>.
  *
  * FM is able to estimate interactions even in problems with huge sparsity
@@ -291,6 +297,7 @@ private[regression] trait FMRegressorParams extends FactorizationMachinesParams 
  * FM regression model uses MSE loss which can be solved by gradient descent method, and
  * regularization terms like L2 are usually added to the loss function to prevent overfitting.
  */
+// scalastyle:on line.size.limit
 @Since("3.0.0")
 class FMRegressor @Since("3.0.0") (
     @Since("3.0.0") override val uid: String)
@@ -308,7 +315,6 @@ class FMRegressor @Since("3.0.0") (
    */
   @Since("3.0.0")
   def setFactorSize(value: Int): this.type = set(factorSize, value)
-  setDefault(factorSize -> 8)
 
   /**
    * Set whether to fit intercept term.
@@ -318,7 +324,6 @@ class FMRegressor @Since("3.0.0") (
    */
   @Since("3.0.0")
   def setFitIntercept(value: Boolean): this.type = set(fitIntercept, value)
-  setDefault(fitIntercept -> true)
 
   /**
    * Set whether to fit linear term.
@@ -328,7 +333,6 @@ class FMRegressor @Since("3.0.0") (
    */
   @Since("3.0.0")
   def setFitLinear(value: Boolean): this.type = set(fitLinear, value)
-  setDefault(fitLinear -> true)
 
   /**
    * Set the L2 regularization parameter.
@@ -338,7 +342,6 @@ class FMRegressor @Since("3.0.0") (
    */
   @Since("3.0.0")
   def setRegParam(value: Double): this.type = set(regParam, value)
-  setDefault(regParam -> 0.0)
 
   /**
    * Set the mini-batch fraction parameter.
@@ -348,7 +351,6 @@ class FMRegressor @Since("3.0.0") (
    */
   @Since("3.0.0")
   def setMiniBatchFraction(value: Double): this.type = set(miniBatchFraction, value)
-  setDefault(miniBatchFraction -> 1.0)
 
   /**
    * Set the standard deviation of initial coefficients.
@@ -358,7 +360,6 @@ class FMRegressor @Since("3.0.0") (
    */
   @Since("3.0.0")
   def setInitStd(value: Double): this.type = set(initStd, value)
-  setDefault(initStd -> 0.01)
 
   /**
    * Set the maximum number of iterations.
@@ -368,7 +369,6 @@ class FMRegressor @Since("3.0.0") (
    */
   @Since("3.0.0")
   def setMaxIter(value: Int): this.type = set(maxIter, value)
-  setDefault(maxIter -> 100)
 
   /**
    * Set the initial step size for the first step (like learning rate).
@@ -378,7 +378,6 @@ class FMRegressor @Since("3.0.0") (
    */
   @Since("3.0.0")
   def setStepSize(value: Double): this.type = set(stepSize, value)
-  setDefault(stepSize -> 1.0)
 
   /**
    * Set the convergence tolerance of iterations.
@@ -388,7 +387,6 @@ class FMRegressor @Since("3.0.0") (
    */
   @Since("3.0.0")
   def setTol(value: Double): this.type = set(tol, value)
-  setDefault(tol -> 1E-6)
 
   /**
    * Set the solver algorithm used for optimization.
@@ -399,7 +397,6 @@ class FMRegressor @Since("3.0.0") (
    */
   @Since("3.0.0")
   def setSolver(value: String): this.type = set(solver, value)
-  setDefault(solver -> AdamW)
 
   /**
    * Set the random seed for weight initialization.
@@ -418,16 +415,20 @@ class FMRegressor @Since("3.0.0") (
     instr.logParams(this, factorSize, fitIntercept, fitLinear, regParam,
       miniBatchFraction, initStd, maxIter, stepSize, tol, solver)
 
-    val numFeatures = MetadataUtils.getNumFeatures(dataset, $(featuresCol))
+    val numFeatures = getNumFeatures(dataset, $(featuresCol))
     instr.logNumFeatures(numFeatures)
 
     val handlePersistence = dataset.storageLevel == StorageLevel.NONE
-    val labeledPoint = extractLabeledPoints(dataset)
-    val data: RDD[(Double, OldVector)] = labeledPoint.map(x => (x.label, x.features))
+
+    val data = dataset.select(
+      checkRegressionLabels($(labelCol)),
+      checkNonNanVectors($(featuresCol))
+    ).rdd.map { case Row(l: Double, v: Vector) => (l, OldVectors.fromML(v))
+    }.setName("training instances")
 
     if (handlePersistence) data.persist(StorageLevel.MEMORY_AND_DISK)
 
-    val coefficients = trainImpl(data, numFeatures, SquaredError)
+    val (coefficients, _) = trainImpl(data, numFeatures, SquaredError)
 
     val (intercept, linear, factors) = splitCoefficients(
       coefficients, numFeatures, $(factorSize), $(fitIntercept), $(fitLinear))
@@ -561,7 +562,7 @@ object FMRegressionModel extends MLReadable[FMRegressionModel] {
  *   \hat{y} = p\left( y_{fm} \right)
  * }}}
  * p is the prediction function, for binary classification task is sigmoid.
- * The loss funcation gradient formula:
+ * The loss function gradient formula:
  * {{{
  *   \frac{\partial}{\partial\theta} l\left( \hat{y},y \right) =
  *   \frac{\partial}{\partial\theta} l\left( p\left( y_{fm} \right),y \right) =

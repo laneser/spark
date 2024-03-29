@@ -22,7 +22,7 @@ import java.util.Locale
 import breeze.linalg.normalize
 import breeze.numerics.exp
 import org.apache.hadoop.fs.Path
-import org.json4s.DefaultFormats
+import org.json4s.{DefaultFormats, Formats}
 import org.json4s.JsonAST.JObject
 import org.json4s.jackson.JsonMethods._
 
@@ -33,6 +33,7 @@ import org.apache.spark.ml.linalg._
 import org.apache.spark.ml.param._
 import org.apache.spark.ml.param.shared.{HasCheckpointInterval, HasFeaturesCol, HasMaxIter, HasSeed}
 import org.apache.spark.ml.util._
+import org.apache.spark.ml.util.DatasetUtils._
 import org.apache.spark.ml.util.DefaultParamsReader.Metadata
 import org.apache.spark.ml.util.Instrumentation.instrumented
 import org.apache.spark.mllib.clustering.{DistributedLDAModel => OldDistributedLDAModel,
@@ -48,6 +49,7 @@ import org.apache.spark.sql.{DataFrame, Dataset, Row, SparkSession}
 import org.apache.spark.sql.functions.{monotonically_increasing_id, udf}
 import org.apache.spark.sql.types.StructType
 import org.apache.spark.storage.StorageLevel
+import org.apache.spark.util.ArrayImplicits._
 import org.apache.spark.util.PeriodicCheckpointer
 import org.apache.spark.util.VersionUtils
 
@@ -199,8 +201,6 @@ private[clustering] trait LDAParams extends Params with HasFeaturesCol with HasM
     " with estimates of the topic mixture distribution for each document (often called \"theta\"" +
     " in the literature).  Returns a vector of zeros for an empty document.")
 
-  setDefault(topicDistributionCol -> "topicDistribution")
-
   /** @group getParam */
   @Since("1.6.0")
   def getTopicDistributionCol: String = $(topicDistributionCol)
@@ -315,6 +315,11 @@ private[clustering] trait LDAParams extends Params with HasFeaturesCol with HasM
   @Since("2.0.0")
   def getKeepLastCheckpoint: Boolean = $(keepLastCheckpoint)
 
+  setDefault(maxIter -> 20, k -> 10, optimizer -> "online", checkpointInterval -> 10,
+    learningOffset -> 1024, learningDecay -> 0.51, subsamplingRate -> 0.05,
+    optimizeDocConcentration -> true, keepLastCheckpoint -> true,
+    topicDistributionCol -> "topicDistribution")
+
   /**
    * Validates and transforms the input schema.
    *
@@ -380,7 +385,7 @@ private object LDAParams {
   def getAndSetParams(model: LDAParams, metadata: Metadata): Unit = {
     VersionUtils.majorMinorVersion(metadata.sparkVersion) match {
       case (1, 6) =>
-        implicit val format = DefaultFormats
+        implicit val format: Formats = DefaultFormats
         metadata.params match {
           case JObject(pairs) =>
             pairs.foreach { case (paramName, jsonValue) =>
@@ -464,7 +469,7 @@ abstract class LDAModel private[ml] (
     val func = getTopicDistributionMethod
     val transformer = udf(func)
     dataset.withColumn($(topicDistributionCol),
-      transformer(DatasetUtils.columnToVector(dataset, getFeaturesCol)),
+      transformer(columnToVector(dataset, getFeaturesCol)),
       outputSchema($(topicDistributionCol)).metadata)
   }
 
@@ -587,9 +592,10 @@ abstract class LDAModel private[ml] (
   def describeTopics(maxTermsPerTopic: Int): DataFrame = {
     val topics = getModel.describeTopics(maxTermsPerTopic).zipWithIndex.map {
       case ((termIndices, termWeights), topic) =>
-        (topic, termIndices.toSeq, termWeights.toSeq)
+        (topic, termIndices.toImmutableArraySeq, termWeights.toImmutableArraySeq)
     }
-    sparkSession.createDataFrame(topics).toDF("topic", "termIndices", "termWeights")
+    sparkSession.createDataFrame(topics.toImmutableArraySeq)
+      .toDF("topic", "termIndices", "termWeights")
   }
 
   @Since("1.6.0")
@@ -863,10 +869,6 @@ class LDA @Since("1.6.0") (
   @Since("1.6.0")
   def this() = this(Identifiable.randomUID("lda"))
 
-  setDefault(maxIter -> 20, k -> 10, optimizer -> "online", checkpointInterval -> 10,
-    learningOffset -> 1024, learningDecay -> 0.51, subsamplingRate -> 0.05,
-    optimizeDocConcentration -> true, keepLastCheckpoint -> true)
-
   /**
    * The features for LDA should be a `Vector` representing the word counts in a document.
    * The vector should be of length vocabSize, with counts for each term (word).
@@ -946,6 +948,7 @@ class LDA @Since("1.6.0") (
       learningDecay, optimizer, learningOffset, seed)
 
     val oldData = LDA.getOldDataset(dataset, $(featuresCol))
+      .setName("training instances")
 
     // The EM solver will transform this oldData to a graph, and use a internal graphCheckpointer
     // to update and cache the graph, so we do not need to cache it.
@@ -994,13 +997,10 @@ object LDA extends MLReadable[LDA] {
   private[clustering] def getOldDataset(
        dataset: Dataset[_],
        featuresCol: String): RDD[(Long, OldVector)] = {
-    dataset
-      .select(monotonically_increasing_id(),
-        DatasetUtils.columnToVector(dataset, featuresCol))
-      .rdd
-      .map { case Row(docId: Long, features: Vector) =>
-        (docId, OldVectors.fromML(features))
-      }
+    dataset.select(
+      monotonically_increasing_id(),
+      checkNonNanVectors(columnToVector(dataset, featuresCol))
+    ).rdd.map { case Row(docId: Long, f: Vector) => (docId, OldVectors.fromML(f)) }
   }
 
   private class LDAReader extends MLReader[LDA] {

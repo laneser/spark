@@ -24,11 +24,13 @@ import java.util.concurrent.TimeoutException
 
 import scala.collection.mutable.ListBuffer
 import scala.concurrent.{Future, Promise}
+// scalastyle:off executioncontextglobal
 import scala.concurrent.ExecutionContext.Implicits.global
+// scalastyle:on executioncontextglobal
 import scala.concurrent.duration._
 import scala.sys.process._
 
-import org.json4s._
+import org.json4s.Formats
 import org.json4s.jackson.JsonMethods
 
 import org.apache.spark.{SparkConf, SparkContext}
@@ -205,7 +207,7 @@ private object FaultToleranceTest extends App with Logging {
 
   private def addWorkers(num: Int): Unit = {
     logInfo(s">>>>> ADD WORKERS $num <<<<<")
-    val masterUrls = getMasterUrls(masters)
+    val masterUrls = getMasterUrls(masters.toSeq)
     (1 to num).foreach { _ => workers += SparkDocker.startWorker(dockerMountDir, masterUrls) }
   }
 
@@ -216,7 +218,7 @@ private object FaultToleranceTest extends App with Logging {
     // Counter-hack: Because of a hack in SparkEnv#create() that changes this
     // property, we need to reset it.
     System.setProperty(config.DRIVER_PORT.key, "0")
-    sc = new SparkContext(getMasterUrls(masters), "fault-tolerance", containerSparkHome)
+    sc = new SparkContext(getMasterUrls(masters.toSeq), "fault-tolerance", containerSparkHome)
   }
 
   private def getMasterUrls(masters: Seq[TestMasterInfo]): String = {
@@ -279,7 +281,7 @@ private object FaultToleranceTest extends App with Logging {
     var liveWorkerIPs: Seq[String] = List()
 
     def stateValid(): Boolean = {
-      (workers.map(_.ip) -- liveWorkerIPs).isEmpty &&
+      workers.map(_.ip).forall(liveWorkerIPs.contains) &&
         numAlive == 1 && numStandby == masters.size - 1 && numLiveApps >= 1
     }
 
@@ -339,7 +341,7 @@ private object FaultToleranceTest extends App with Logging {
 private class TestMasterInfo(val ip: String, val dockerId: DockerId, val logFile: File)
   extends Logging  {
 
-  implicit val formats = org.json4s.DefaultFormats
+  implicit val formats: Formats = org.json4s.DefaultFormats
   var state: RecoveryState.Value = _
   var liveWorkerIPs: List[String] = _
   var numLiveApps = 0
@@ -382,7 +384,7 @@ private class TestMasterInfo(val ip: String, val dockerId: DockerId, val logFile
 private class TestWorkerInfo(val ip: String, val dockerId: DockerId, val logFile: File)
   extends Logging {
 
-  implicit val formats = org.json4s.DefaultFormats
+  implicit val formats: Formats = org.json4s.DefaultFormats
 
   logDebug("Created worker: " + this)
 

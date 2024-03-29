@@ -31,6 +31,7 @@ import org.apache.spark.sql.{DataFrame, Dataset}
 import org.apache.spark.sql.expressions.UserDefinedFunction
 import org.apache.spark.sql.functions.{col, lit, udf}
 import org.apache.spark.sql.types.{DoubleType, StructField, StructType}
+import org.apache.spark.util.ArrayImplicits._
 
 /** Private trait for params and common methods for OneHotEncoder and OneHotEncoderModel */
 private[ml] trait OneHotEncoderBase extends Params with HasHandleInvalid
@@ -53,8 +54,6 @@ private[ml] trait OneHotEncoderBase extends Params with HasHandleInvalid
     "during fitting, invalid data will result in an error.",
     ParamValidators.inArray(OneHotEncoder.supportedHandleInvalids))
 
-  setDefault(handleInvalid, OneHotEncoder.ERROR_INVALID)
-
   /**
    * Whether to drop the last category in the encoded vector (default: true)
    * @group param
@@ -62,11 +61,12 @@ private[ml] trait OneHotEncoderBase extends Params with HasHandleInvalid
   @Since("2.3.0")
   final val dropLast: BooleanParam =
     new BooleanParam(this, "dropLast", "whether to drop the last category")
-  setDefault(dropLast -> true)
 
   /** @group getParam */
   @Since("2.3.0")
   def getDropLast: Boolean = $(dropLast)
+
+  setDefault(handleInvalid -> OneHotEncoder.ERROR_INVALID, dropLast -> true)
 
   /** Returns the input and output column names corresponding in pair. */
   private[feature] def getInOutCols(): (Array[String], Array[String]) = {
@@ -194,7 +194,8 @@ class OneHotEncoder @Since("3.0.0") (@Since("3.0.0") override val uid: String)
       // When fitting data, we want the plain number of categories without `handleInvalid` and
       // `dropLast` taken into account.
       val attrGroups = OneHotEncoderCommon.getOutputAttrGroupFromData(
-        dataset, inputColNames, outputColNames, dropLast = false)
+        dataset, inputColNames.toImmutableArraySeq, outputColNames.toImmutableArraySeq,
+        dropLast = false)
       attrGroups.zip(columnToScanIndices).foreach { case (attrGroup, idx) =>
         categorySizes(idx) = attrGroup.size
       }
@@ -373,7 +374,7 @@ class OneHotEncoderModel private[ml] (
       encoder(col(inputColName).cast(DoubleType), lit(idx))
         .as(outputColName, metadata)
     }
-    dataset.withColumns(outputColNames, encodedColumns)
+    dataset.withColumns(outputColNames.toImmutableArraySeq, encodedColumns)
   }
 
   @Since("3.0.0")

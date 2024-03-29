@@ -88,17 +88,19 @@ public class ChunkFetchRequestHandler extends SimpleChannelInboundHandler<ChunkF
       logger.trace("Received req from {} to fetch block {}", getRemoteAddress(channel),
         msg.streamChunkId);
     }
-    long chunksBeingTransferred = streamManager.chunksBeingTransferred();
-    if (chunksBeingTransferred >= maxChunksBeingTransferred) {
-      logger.warn("The number of chunks being transferred {} is above {}, close the connection.",
-        chunksBeingTransferred, maxChunksBeingTransferred);
-      channel.close();
-      return;
+    if (maxChunksBeingTransferred < Long.MAX_VALUE) {
+      long chunksBeingTransferred = streamManager.chunksBeingTransferred();
+      if (chunksBeingTransferred >= maxChunksBeingTransferred) {
+        logger.warn("The number of chunks being transferred {} is above {}, close the connection.",
+          chunksBeingTransferred, maxChunksBeingTransferred);
+        channel.close();
+        return;
+      }
     }
     ManagedBuffer buf;
     try {
-      streamManager.checkAuthorization(client, msg.streamChunkId.streamId);
-      buf = streamManager.getChunk(msg.streamChunkId.streamId, msg.streamChunkId.chunkIndex);
+      streamManager.checkAuthorization(client, msg.streamChunkId.streamId());
+      buf = streamManager.getChunk(msg.streamChunkId.streamId(), msg.streamChunkId.chunkIndex());
       if (buf == null) {
         throw new IllegalStateException("Chunk was not found");
       }
@@ -110,9 +112,9 @@ public class ChunkFetchRequestHandler extends SimpleChannelInboundHandler<ChunkF
       return;
     }
 
-    streamManager.chunkBeingSent(msg.streamChunkId.streamId);
+    streamManager.chunkBeingSent(msg.streamChunkId.streamId());
     respond(channel, new ChunkFetchSuccess(msg.streamChunkId, buf)).addListener(
-      (ChannelFutureListener) future -> streamManager.chunkSent(msg.streamChunkId.streamId));
+      (ChannelFutureListener) future -> streamManager.chunkSent(msg.streamChunkId.streamId()));
   }
 
   /**

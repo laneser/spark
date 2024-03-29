@@ -32,10 +32,12 @@ import org.apache.spark.unsafe.memory.MemoryBlock;
 import org.apache.spark.unsafe.types.UTF8String;
 import org.apache.spark.util.collection.unsafe.sort.*;
 
-import org.junit.After;
-import org.junit.Assert;
-import org.junit.Before;
-import org.junit.Test;
+import org.junit.jupiter.api.AfterEach;
+import org.junit.jupiter.api.Assertions;
+import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.Test;
+
+import java.nio.ByteOrder;
 
 /**
  * Test the RecordBinaryComparator, which compares two UnsafeRows by their binary form.
@@ -55,7 +57,7 @@ public class RecordBinaryComparatorSuite {
   private LongArray array;
   private int pos;
 
-  @Before
+  @BeforeEach
   public void beforeEach() {
     // Only compare between two input rows.
     array = consumer.allocateArray(2);
@@ -65,7 +67,7 @@ public class RecordBinaryComparatorSuite {
     pageCursor = dataPage.getBaseOffset();
   }
 
-  @After
+  @AfterEach
   public void afterEach() {
     consumer.freePage(dataPage);
     dataPage = null;
@@ -82,14 +84,14 @@ public class RecordBinaryComparatorSuite {
     int recordLength = row.getSizeInBytes();
 
     Object baseObject = dataPage.getBaseObject();
-    Assert.assertTrue(pageCursor + recordLength <= dataPage.getBaseOffset() + dataPage.size());
+    Assertions.assertTrue(pageCursor + recordLength <= dataPage.getBaseOffset() + dataPage.size());
     long recordAddress = memoryManager.encodePageNumberAndOffset(dataPage, pageCursor);
     UnsafeAlignedOffset.putSize(baseObject, pageCursor, recordLength);
     pageCursor += uaoSize;
     Platform.copyMemory(recordBase, recordOffset, baseObject, pageCursor, recordLength);
     pageCursor += recordLength;
 
-    Assert.assertTrue(pos < 2);
+    Assertions.assertTrue(pos < 2);
     array.set(pos, recordAddress);
     pos++;
   }
@@ -142,8 +144,8 @@ public class RecordBinaryComparatorSuite {
     insertRow(row1);
     insertRow(row2);
 
-    Assert.assertEquals(0, compare(0, 0));
-    Assert.assertTrue(compare(0, 1) < 0);
+    Assertions.assertEquals(0, compare(0, 0));
+    Assertions.assertTrue(compare(0, 1) < 0);
   }
 
   @Test
@@ -167,8 +169,8 @@ public class RecordBinaryComparatorSuite {
     insertRow(row1);
     insertRow(row2);
 
-    Assert.assertEquals(0, compare(0, 0));
-    Assert.assertTrue(compare(0, 1) < 0);
+    Assertions.assertEquals(0, compare(0, 0));
+    Assertions.assertTrue(compare(0, 1) < 0);
   }
 
   @Test
@@ -194,8 +196,8 @@ public class RecordBinaryComparatorSuite {
     insertRow(row1);
     insertRow(row2);
 
-    Assert.assertEquals(0, compare(0, 0));
-    Assert.assertTrue(compare(0, 1) > 0);
+    Assertions.assertEquals(0, compare(0, 0));
+    Assertions.assertTrue(compare(0, 1) > 0);
   }
 
   @Test
@@ -227,8 +229,8 @@ public class RecordBinaryComparatorSuite {
     insertRow(row1);
     insertRow(row2);
 
-    Assert.assertEquals(0, compare(0, 0));
-    Assert.assertTrue(compare(0, 1) > 0);
+    Assertions.assertEquals(0, compare(0, 0));
+    Assertions.assertTrue(compare(0, 1) > 0);
   }
 
   @Test
@@ -253,48 +255,82 @@ public class RecordBinaryComparatorSuite {
     insertRow(row1);
     insertRow(row2);
 
-    Assert.assertEquals(0, compare(0, 0));
-    Assert.assertTrue(compare(0, 1) > 0);
+    Assertions.assertEquals(0, compare(0, 0));
+    Assertions.assertTrue(compare(0, 1) > 0);
   }
 
   @Test
   public void testBinaryComparatorWhenSubtractionIsDivisibleByMaxIntValue() throws Exception {
     int numFields = 1;
 
+    // Place the following bytes (hex) into UnsafeRows for the comparison:
+    //
+    //   index | 00 01 02 03 04 05 06 07
+    //   ------+------------------------
+    //   row1  | 00 00 00 00 00 00 00 0b
+    //   row2  | 00 00 00 00 80 00 00 0a
+    //
+    // The byte layout needs to be identical on all platforms regardless of
+    // of endianness. To achieve this the bytes in each value are reversed
+    // on little-endian platforms.
+    long row1Data = 11L;
+    long row2Data = 11L + Integer.MAX_VALUE;
+    if (ByteOrder.nativeOrder().equals(ByteOrder.LITTLE_ENDIAN)) {
+      row1Data = Long.reverseBytes(row1Data);
+      row2Data = Long.reverseBytes(row2Data);
+    }
+
     UnsafeRow row1 = new UnsafeRow(numFields);
     byte[] data1 = new byte[100];
     row1.pointTo(data1, computeSizeInBytes(numFields * 8));
-    row1.setLong(0, 11);
+    row1.setLong(0, row1Data);
 
     UnsafeRow row2 = new UnsafeRow(numFields);
     byte[] data2 = new byte[100];
     row2.pointTo(data2, computeSizeInBytes(numFields * 8));
-    row2.setLong(0, 11L + Integer.MAX_VALUE);
+    row2.setLong(0, row2Data);
 
     insertRow(row1);
     insertRow(row2);
 
-    Assert.assertTrue(compare(0, 1) > 0);
+    Assertions.assertTrue(compare(0, 1) < 0);
   }
 
   @Test
   public void testBinaryComparatorWhenSubtractionCanOverflowLongValue() throws Exception {
     int numFields = 1;
 
+    // Place the following bytes (hex) into UnsafeRows for the comparison:
+    //
+    //   index | 00 01 02 03 04 05 06 07
+    //   ------+------------------------
+    //   row1  | 80 00 00 00 00 00 00 00
+    //   row2  | 00 00 00 00 00 00 00 01
+    //
+    // The byte layout needs to be identical on all platforms regardless of
+    // of endianness. To achieve this the bytes in each value are reversed
+    // on little-endian platforms.
+    long row1Data = Long.MIN_VALUE;
+    long row2Data = 1L;
+    if (ByteOrder.nativeOrder().equals(ByteOrder.LITTLE_ENDIAN)) {
+      row1Data = Long.reverseBytes(row1Data);
+      row2Data = Long.reverseBytes(row2Data);
+    }
+
     UnsafeRow row1 = new UnsafeRow(numFields);
     byte[] data1 = new byte[100];
     row1.pointTo(data1, computeSizeInBytes(numFields * 8));
-    row1.setLong(0, Long.MIN_VALUE);
+    row1.setLong(0, row1Data);
 
     UnsafeRow row2 = new UnsafeRow(numFields);
     byte[] data2 = new byte[100];
     row2.pointTo(data2, computeSizeInBytes(numFields * 8));
-    row2.setLong(0, 1);
+    row2.setLong(0, row2Data);
 
     insertRow(row1);
     insertRow(row2);
 
-    Assert.assertTrue(compare(0, 1) < 0);
+    Assertions.assertTrue(compare(0, 1) > 0);
   }
 
   @Test
@@ -320,7 +356,7 @@ public class RecordBinaryComparatorSuite {
     insertRow(row1);
     insertRow(row2);
 
-    Assert.assertTrue(compare(0, 1) < 0);
+    Assertions.assertTrue(compare(0, 1) < 0);
   }
 
   @Test
@@ -342,7 +378,7 @@ public class RecordBinaryComparatorSuite {
     // both left and right offset is not aligned, it will start with byte-by-byte comparison
     int result2 = binaryComparator.compare(arr3, arrayOffset, 8, arr4, arrayOffset, 8);
 
-    Assert.assertEquals(result1, result2);
+    Assertions.assertEquals(result1, result2);
   }
 
   @Test
@@ -364,6 +400,6 @@ public class RecordBinaryComparatorSuite {
     // so it will start with byte-by-byte comparison
     int result2 = binaryComparator.compare(arr3, arrayOffset, 8, arr4, arrayOffset, 8);
 
-    Assert.assertEquals(result1, result2);
+    Assertions.assertEquals(result1, result2);
   }
 }

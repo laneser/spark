@@ -23,56 +23,72 @@ import java.util.{Locale, MissingFormatArgumentException}
 
 import scala.util.control.NonFatal
 
-import org.apache.commons.io.FileUtils
 import org.apache.commons.lang3.exception.ExceptionUtils
 
 import org.apache.spark.SparkException
+import org.apache.spark.internal.Logging
 import org.apache.spark.sql.SQLQueryTestSuite
 import org.apache.spark.sql.catalyst.analysis.NoSuchTableException
 import org.apache.spark.sql.catalyst.util.fileToString
 import org.apache.spark.sql.execution.HiveResult.{getTimeFormatters, toHiveString, TimeFormatters}
 import org.apache.spark.sql.internal.SQLConf
+import org.apache.spark.sql.internal.SQLConf.TimestampTypes
 import org.apache.spark.sql.types._
+import org.apache.spark.util.Utils
 
+// scalastyle:off line.size.limit
 /**
  * Re-run all the tests in SQLQueryTestSuite via Thrift Server.
  *
+ * Each case is loaded from a file in "spark/sql/core/src/test/resources/sql-tests/inputs".
+ * Each case has a golden result file in "spark/sql/core/src/test/resources/sql-tests/results".
+ *
  * To run the entire test suite:
  * {{{
- *   build/sbt "hive-thriftserver/test-only *ThriftServerQueryTestSuite" -Phive-thriftserver
+ *   build/sbt -Phive-thriftserver "hive-thriftserver/testOnly org.apache.spark.sql.hive.thriftserver.ThriftServerQueryTestSuite"
+ * }}}
+ *
+ * To run a single test file upon change:
+ * {{{
+ *   build/sbt -Phive-thriftserver "hive-thriftserver/testOnly org.apache.spark.sql.hive.thriftserver.ThriftServerQueryTestSuite -- -z inline-table.sql"
  * }}}
  *
  * This test suite won't generate golden files. To re-generate golden files for entire suite, run:
  * {{{
- *   SPARK_GENERATE_GOLDEN_FILES=1 build/sbt "sql/test-only *SQLQueryTestSuite"
+ *   SPARK_GENERATE_GOLDEN_FILES=1 build/sbt "sql/testOnly org.apache.spark.sql.SQLQueryTestSuite"
+ * }}}
+ *
+ * To re-generate golden file for a single test, run:
+ * {{{
+ *   SPARK_GENERATE_GOLDEN_FILES=1 build/sbt "sql/testOnly org.apache.spark.sql.SQLQueryTestSuite -- -z describe.sql"
  * }}}
  *
  * TODO:
  *   1. Support UDF testing.
  *   2. Support DESC command.
  *   3. Support SHOW command.
+ *   4. Support UDAF testing.
  */
-class ThriftServerQueryTestSuite extends SQLQueryTestSuite with SharedThriftServer {
+// scalastyle:on line.size.limit
+class ThriftServerQueryTestSuite extends SQLQueryTestSuite with SharedThriftServer with Logging {
 
 
   override def mode: ServerMode.Value = ServerMode.binary
 
   override protected def testFile(fileName: String): String = {
-    val url = Thread.currentThread().getContextClassLoader.getResource(fileName)
-    // Copy to avoid URISyntaxException during accessing the resources in `sql/core`
-    val file = File.createTempFile("thriftserver-test", ".data")
-    file.deleteOnExit()
-    FileUtils.copyURLToFile(url, file)
-    file.getAbsolutePath
+    copyAndGetResourceFile(fileName, ".data").getAbsolutePath
   }
 
   /** List of test cases to ignore, in lower cases. */
-  override def blackList: Set[String] = super.blackList ++ Set(
+  override def ignoreList: Set[String] = super.ignoreList ++ Set(
     // Missing UDF
     "postgreSQL/boolean.sql",
     "postgreSQL/case.sql",
     // SPARK-28624
-    "date.sql",
+    "postgreSQL/date.sql",
+    "datetime-special.sql",
+    "ansi/datetime-special.sql",
+    "timestampNTZ/datetime-special.sql",
     // SPARK-28620
     "postgreSQL/float4.sql",
     // SPARK-28636
@@ -83,7 +99,11 @@ class ThriftServerQueryTestSuite extends SQLQueryTestSuite with SharedThriftServ
     "subquery/in-subquery/in-group-by.sql",
     "subquery/in-subquery/simple-in.sql",
     "subquery/in-subquery/in-order-by.sql",
-    "subquery/in-subquery/in-set-operations.sql"
+    "subquery/in-subquery/in-set-operations.sql",
+    // SPARK-42921
+    "timestampNTZ/datetime-special-ansi.sql",
+    // SPARK-47264
+    "collations.sql"
   )
 
   override def runQueries(
@@ -91,31 +111,37 @@ class ThriftServerQueryTestSuite extends SQLQueryTestSuite with SharedThriftServ
       testCase: TestCase,
       configSet: Seq[(String, String)]): Unit = {
     // We do not test with configSet.
-    withJdbcStatement { statement =>
+    withJdbcStatement() { statement =>
 
       configSet.foreach { case (k, v) =>
         statement.execute(s"SET $k = $v")
       }
 
       testCase match {
-        case _: PgSQLTest | _: AnsiTest =>
+        case _: SQLQueryTestSuite#PgSQLTest =>
           statement.execute(s"SET ${SQLConf.ANSI_ENABLED.key} = true")
+          statement.execute(s"SET ${SQLConf.LEGACY_INTERVAL_ENABLED.key} = true")
+        case _: SQLQueryTestSuite#AnsiTest =>
+          statement.execute(s"SET ${SQLConf.ANSI_ENABLED.key} = true")
+        case _: SQLQueryTestSuite#TimestampNTZTest =>
+          statement.execute(s"SET ${SQLConf.TIMESTAMP_TYPE.key} = " +
+            s"${TimestampTypes.TIMESTAMP_NTZ.toString}")
         case _ =>
           statement.execute(s"SET ${SQLConf.ANSI_ENABLED.key} = false")
       }
 
       // Run the SQL queries preparing them for comparison.
-      val outputs: Seq[QueryOutput] = queries.map { sql =>
+      val outputs: Seq[QueryTestOutput] = queries.map { sql =>
         val (_, output) = handleExceptions(getNormalizedResult(statement, sql))
         // We might need to do some query canonicalization in the future.
-        QueryOutput(
+        ExecutionOutput(
           sql = sql,
-          schema = "",
+          schema = Some(""),
           output = output.mkString("\n").replaceAll("\\s+$", ""))
       }
 
       // Read back the golden file.
-      val expectedOutputs: Seq[QueryOutput] = {
+      val expectedOutputs: Seq[QueryTestOutput] = {
         val goldenOutput = fileToString(new File(testCase.resultFile))
         val segments = goldenOutput.split("-- !query.*\n")
 
@@ -132,9 +158,9 @@ class ThriftServerQueryTestSuite extends SQLQueryTestSuite with SharedThriftServ
           } else {
             originalOut
           }
-          QueryOutput(
+          ExecutionOutput(
             sql = sql,
-            schema = "",
+            schema = Some(""),
             output = output.replaceAll("\\s+$", "")
           )
         }
@@ -208,30 +234,41 @@ class ThriftServerQueryTestSuite extends SQLQueryTestSuite with SharedThriftServ
   }
 
   override def createScalaTestCase(testCase: TestCase): Unit = {
-    if (blackList.exists(t =>
+    if (ignoreList.exists(t =>
       testCase.name.toLowerCase(Locale.ROOT).contains(t.toLowerCase(Locale.ROOT)))) {
       // Create a test case to ignore this case.
       ignore(testCase.name) { /* Do nothing */ }
     } else {
       // Create a test case to run this case.
       test(testCase.name) {
-        runTest(testCase)
+        runSqlTestCase(testCase, listTestCases)
       }
     }
   }
 
   override lazy val listTestCases: Seq[TestCase] = {
     listFilesRecursively(new File(inputFilePath)).flatMap { file =>
-      val resultFile = file.getAbsolutePath.replace(inputFilePath, goldenFilePath) + ".out"
+      var resultFile = resultFileForInputFile(file)
+      // JDK-4511638 changes 'toString' result of Float/Double
+      // JDK-8282081 changes DataTimeFormatter 'F' symbol
+      if (Utils.isJavaVersionAtLeast21 && (new File(resultFile + ".java21")).exists()) {
+        resultFile += ".java21"
+      }
       val absPath = file.getAbsolutePath
       val testCaseName = absPath.stripPrefix(inputFilePath).stripPrefix(File.separator)
 
       if (file.getAbsolutePath.startsWith(s"$inputFilePath${File.separator}udf")) {
         Seq.empty
+      } else if (file.getAbsolutePath.startsWith(s"$inputFilePath${File.separator}udaf")) {
+        Seq.empty
+      } else if (file.getAbsolutePath.startsWith(s"$inputFilePath${File.separator}udtf")) {
+        Seq.empty
       } else if (file.getAbsolutePath.startsWith(s"$inputFilePath${File.separator}postgreSQL")) {
         PgSQLTestCase(testCaseName, absPath, resultFile) :: Nil
       } else if (file.getAbsolutePath.startsWith(s"$inputFilePath${File.separator}ansi")) {
         AnsiTestCase(testCaseName, absPath, resultFile) :: Nil
+      } else if (file.getAbsolutePath.startsWith(s"$inputFilePath${File.separator}timestampNTZ")) {
+        TimestampNTZTestCase(testCaseName, absPath, resultFile) :: Nil
       } else {
         RegularTestCase(testCaseName, absPath, resultFile) :: Nil
       }
@@ -239,7 +276,7 @@ class ThriftServerQueryTestSuite extends SQLQueryTestSuite with SharedThriftServ
   }
 
   test("Check if ThriftServer can work") {
-    withJdbcStatement { statement =>
+    withJdbcStatement() { statement =>
       val rs = statement.executeQuery("select 1L")
       rs.next()
       assert(rs.getLong(1) === 1L)

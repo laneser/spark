@@ -31,6 +31,7 @@ import org.apache.spark.sql.catalyst.expressions.{If, Literal}
 import org.apache.spark.sql.expressions.Aggregator
 import org.apache.spark.sql.functions._
 import org.apache.spark.sql.types._
+import org.apache.spark.util.ArrayImplicits._
 import org.apache.spark.util.ThreadUtils
 import org.apache.spark.util.VersionUtils.majorMinorVersion
 import org.apache.spark.util.collection.OpenHashMap
@@ -56,8 +57,6 @@ private[feature] trait StringIndexerBase extends Params with HasHandleInvalid wi
     "or 'keep' (put invalid data in a special additional bucket, at index numLabels).",
     ParamValidators.inArray(StringIndexer.supportedHandleInvalids))
 
-  setDefault(handleInvalid, StringIndexer.ERROR_INVALID)
-
   /**
    * Param for how to order labels of string column. The first label after ordering is assigned
    * an index of 0.
@@ -79,6 +78,9 @@ private[feature] trait StringIndexerBase extends Params with HasHandleInvalid wi
     "The first label after ordering is assigned an index of 0. " +
     s"Supported options: ${StringIndexer.supportedStringOrderType.mkString(", ")}.",
     ParamValidators.inArray(StringIndexer.supportedStringOrderType))
+
+  setDefault(handleInvalid -> StringIndexer.ERROR_INVALID,
+    stringOrderType -> StringIndexer.frequencyDesc)
 
   /** @group getParam */
   @Since("2.3.0")
@@ -155,7 +157,6 @@ class StringIndexer @Since("1.4.0") (
   /** @group setParam */
   @Since("2.3.0")
   def setStringOrderType(value: String): this.type = set(stringOrderType, value)
-  setDefault(stringOrderType, StringIndexer.frequencyDesc)
 
   /** @group setParam */
   @Since("1.4.0")
@@ -197,10 +198,10 @@ class StringIndexer @Since("1.4.0") (
     val aggregator = new StringIndexerAggregator(inputCols.length)
     implicit val encoder = Encoders.kryo[Array[OpenHashMap[String, Long]]]
 
-    val selectedCols = getSelectedCols(dataset, inputCols)
+    val selectedCols = getSelectedCols(dataset, inputCols.toImmutableArraySeq)
     dataset.select(selectedCols: _*)
-      .toDF
-      .groupBy().agg(aggregator.toColumn)
+      .toDF()
+      .agg(aggregator.toColumn)
       .as[Array[OpenHashMap[String, Long]]]
       .collect()(0)
   }
@@ -209,7 +210,7 @@ class StringIndexer @Since("1.4.0") (
     val (inputCols, _) = getInOutCols()
 
     val sortFunc = StringIndexer.getSortFunc(ascending = ascending)
-    val orgStrings = countByValue(dataset, inputCols).toSeq
+    val orgStrings = countByValue(dataset, inputCols).toImmutableArraySeq
     ThreadUtils.parmap(orgStrings, "sortingStringLabels", 8) { counts =>
       counts.toSeq.sortWith(sortFunc).map(_._1).toArray
     }.toArray
@@ -218,9 +219,10 @@ class StringIndexer @Since("1.4.0") (
   private def sortByAlphabet(dataset: Dataset[_], ascending: Boolean): Array[Array[String]] = {
     val (inputCols, _) = getInOutCols()
 
-    val selectedCols = getSelectedCols(dataset, inputCols).map(collect_set(_))
+    val selectedCols = getSelectedCols(dataset, inputCols.toImmutableArraySeq).map(collect_set)
     val allLabels = dataset.select(selectedCols: _*)
-      .collect().toSeq.flatMap(_.toSeq).asInstanceOf[Seq[Seq[String]]]
+      .collect().toImmutableArraySeq.flatMap(_.toSeq)
+      .asInstanceOf[scala.collection.Seq[scala.collection.Seq[String]]].toSeq
     ThreadUtils.parmap(allLabels, "sortingStringLabels", 8) { labels =>
       val sorted = labels.filter(_ != null).sorted
       if (ascending) {
@@ -366,7 +368,7 @@ class StringIndexerModel (
   // This filters out any null values and also the input labels which are not in
   // the dataset used for fitting.
   private def filterInvalidData(dataset: Dataset[_], inputColNames: Seq[String]): Dataset[_] = {
-    val conditions: Seq[Column] = (0 until inputColNames.length).map { i =>
+    val conditions: Seq[Column] = inputColNames.indices.map { i =>
       val inputColName = inputColNames(i)
       val labelToIndex = labelsToIndexArray(i)
       // We have this additional lookup at `labelToIndex` when `handleInvalid` is set to
@@ -417,12 +419,12 @@ class StringIndexerModel (
 
     // Skips invalid rows if `handleInvalid` is set to `StringIndexer.SKIP_INVALID`.
     val filteredDataset = if (getHandleInvalid == StringIndexer.SKIP_INVALID) {
-      filterInvalidData(dataset, inputColNames)
+      filterInvalidData(dataset, inputColNames.toImmutableArraySeq)
     } else {
       dataset
     }
 
-    for (i <- 0 until outputColNames.length) {
+    for (i <- outputColNames.indices) {
       val inputColName = inputColNames(i)
       val outputColName = outputColNames(i)
       val labelToIndex = labelsToIndexArray(i)
@@ -442,7 +444,7 @@ class StringIndexerModel (
           .withValues(filteredLabels)
           .toMetadata()
 
-        val indexer = getIndexer(labels, labelToIndex)
+        val indexer = getIndexer(labels.toImmutableArraySeq, labelToIndex)
 
         outputColumns(i) = indexer(dataset(inputColName).cast(StringType))
           .as(outputColName, metadata)
@@ -454,7 +456,8 @@ class StringIndexerModel (
 
     require(filteredOutputColNames.length == filteredOutputColumns.length)
     if (filteredOutputColNames.length > 0) {
-      filteredDataset.withColumns(filteredOutputColNames, filteredOutputColumns)
+      filteredDataset.withColumns(
+        filteredOutputColNames.toImmutableArraySeq, filteredOutputColumns.toImmutableArraySeq)
     } else {
       filteredDataset.toDF()
     }
@@ -522,7 +525,7 @@ object StringIndexerModel extends MLReadable[StringIndexerModel] {
         val data = sparkSession.read.parquet(dataPath)
           .select("labelsArray")
           .head()
-        data.getAs[Seq[Seq[String]]](0).map(_.toArray).toArray
+        data.getSeq[scala.collection.Seq[String]](0).map(_.toArray).toArray
       }
       val model = new StringIndexerModel(metadata.uid, labelsArray)
       metadata.getAndSetParams(model)

@@ -22,10 +22,10 @@ import java.util.{Iterator => JIterator}
 import java.util.concurrent.LinkedBlockingQueue
 import java.util.concurrent.atomic.AtomicBoolean
 
-import scala.collection.JavaConverters._
 import scala.collection.mutable.ArrayBuffer
 import scala.concurrent.Promise
 import scala.concurrent.duration._
+import scala.jdk.CollectionConverters._
 import scala.util.control.NonFatal
 
 import org.apache.spark.SparkConf
@@ -170,7 +170,7 @@ private[util] class BatchedWriteAheadLog(val wrappedLog: WriteAheadLog, conf: Sp
         // We take the latest record for the timestamp. Please refer to the class Javadoc for
         // detailed explanation
         val time = sortedByTime.last.time
-        segment = wrappedLog.write(aggregate(sortedByTime), time)
+        segment = wrappedLog.write(aggregate(sortedByTime.toSeq), time)
       }
       buffer.foreach(_.promise.success(segment))
     } catch {

@@ -45,18 +45,14 @@ private[spark] trait TaskScheduler {
 
   // Invoked after system has successfully initialized (typically in spark context).
   // Yarn uses this to bootstrap allocation of resources based on preferred locations,
-  // wait for slave registrations, etc.
+  // wait for executor registrations, etc.
   def postStartHook(): Unit = { }
 
   // Disconnect from the cluster.
-  def stop(): Unit
+  def stop(exitCode: Int = 0): Unit
 
   // Submit a sequence of tasks to run.
   def submitTasks(taskSet: TaskSet): Unit
-
-  // Kill all the tasks in a stage and fail the stage and all the jobs that depend on the stage.
-  // Throw UnsupportedOperationException if the backend doesn't support kill tasks.
-  def cancelTasks(stageId: Int, interruptThread: Boolean): Unit
 
   /**
    * Kills a task attempt.
@@ -66,7 +62,7 @@ private[spark] trait TaskScheduler {
    */
   def killTaskAttempt(taskId: Long, interruptThread: Boolean, reason: String): Boolean
 
-  // Kill all the running task attempts in a stage.
+  // Kill all the tasks in all the stage attempts of the same stage Id
   // Throw UnsupportedOperationException if the backend doesn't support kill tasks.
   def killAllTaskAttempts(stageId: Int, interruptThread: Boolean, reason: String): Unit
 
@@ -101,7 +97,12 @@ private[spark] trait TaskScheduler {
   /**
    * Process a decommissioning executor.
    */
-  def executorDecommission(executorId: String): Unit
+  def executorDecommission(executorId: String, decommissionInfo: ExecutorDecommissionInfo): Unit
+
+  /**
+   * If an executor is decommissioned, return its corresponding decommission info
+   */
+  def getExecutorDecommissionState(executorId: String): Option[ExecutorDecommissionState]
 
   /**
    * Process a lost executor

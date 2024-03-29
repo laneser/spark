@@ -20,6 +20,7 @@ package org.apache.spark.ml.regression
 import java.util.Locale
 
 import breeze.stats.{distributions => dist}
+import breeze.stats.distributions.Rand.FixedSeed.randBasis
 import org.apache.commons.lang3.StringUtils
 import org.apache.hadoop.fs.Path
 
@@ -29,12 +30,12 @@ import org.apache.spark.internal.Logging
 import org.apache.spark.ml.PredictorParams
 import org.apache.spark.ml.attribute._
 import org.apache.spark.ml.feature.{Instance, OffsetInstance}
-import org.apache.spark.ml.functions.checkNonNegativeWeight
 import org.apache.spark.ml.linalg.{BLAS, Vector, Vectors}
 import org.apache.spark.ml.optim._
 import org.apache.spark.ml.param._
 import org.apache.spark.ml.param.shared._
 import org.apache.spark.ml.util._
+import org.apache.spark.ml.util.DatasetUtils._
 import org.apache.spark.ml.util.Instrumentation.instrumented
 import org.apache.spark.rdd.RDD
 import org.apache.spark.sql.{Column, DataFrame, Dataset, Row}
@@ -181,6 +182,9 @@ private[regression] trait GeneralizedLinearRegressionBase extends PredictorParam
       s"${supportedSolvers.mkString(", ")}. (Default irls)",
     ParamValidators.inArray[String](supportedSolvers))
 
+  setDefault(family -> Gaussian.name, variancePower -> 0.0, maxIter -> 25, tol -> 1E-6,
+    regParam -> 0.0, solver -> IRLS)
+
   @Since("2.0.0")
   override def validateAndTransformSchema(
       schema: StructType,
@@ -257,7 +261,6 @@ class GeneralizedLinearRegression @Since("2.0.0") (@Since("2.0.0") override val 
    */
   @Since("2.0.0")
   def setFamily(value: String): this.type = set(family, value)
-  setDefault(family -> Gaussian.name)
 
   /**
    * Sets the value of param [[variancePower]].
@@ -268,7 +271,6 @@ class GeneralizedLinearRegression @Since("2.0.0") (@Since("2.0.0") override val 
    */
   @Since("2.2.0")
   def setVariancePower(value: Double): this.type = set(variancePower, value)
-  setDefault(variancePower -> 0.0)
 
   /**
    * Sets the value of param [[linkPower]].
@@ -305,7 +307,6 @@ class GeneralizedLinearRegression @Since("2.0.0") (@Since("2.0.0") override val 
    */
   @Since("2.0.0")
   def setMaxIter(value: Int): this.type = set(maxIter, value)
-  setDefault(maxIter -> 25)
 
   /**
    * Sets the convergence tolerance of iterations.
@@ -316,7 +317,6 @@ class GeneralizedLinearRegression @Since("2.0.0") (@Since("2.0.0") override val 
    */
   @Since("2.0.0")
   def setTol(value: Double): this.type = set(tol, value)
-  setDefault(tol -> 1E-6)
 
   /**
    * Sets the regularization parameter for L2 regularization.
@@ -332,7 +332,6 @@ class GeneralizedLinearRegression @Since("2.0.0") (@Since("2.0.0") override val 
    */
   @Since("2.0.0")
   def setRegParam(value: Double): this.type = set(regParam, value)
-  setDefault(regParam -> 0.0)
 
   /**
    * Sets the value of param [[weightCol]].
@@ -364,7 +363,6 @@ class GeneralizedLinearRegression @Since("2.0.0") (@Since("2.0.0") override val 
    */
   @Since("2.0.0")
   def setSolver(value: String): this.type = set(solver, value)
-  setDefault(solver -> IRLS)
 
   /**
    * Sets the link prediction (linear predictor) column name.
@@ -387,7 +385,7 @@ class GeneralizedLinearRegression @Since("2.0.0") (@Since("2.0.0") override val 
     instr.logParams(this, labelCol, featuresCol, weightCol, offsetCol, predictionCol,
       linkPredictionCol, family, solver, fitIntercept, link, maxIter, regParam, tol,
       aggregationDepth)
-    val numFeatures = MetadataUtils.getNumFeatures(dataset, $(featuresCol))
+    val numFeatures = getNumFeatures(dataset, $(featuresCol))
     instr.logNumFeatures(numFeatures)
 
     if (numFeatures > WeightedLeastSquares.MAX_NUM_FEATURES) {
@@ -400,16 +398,19 @@ class GeneralizedLinearRegression @Since("2.0.0") (@Since("2.0.0") override val 
       "GeneralizedLinearRegression was given data with 0 features, and with Param fitIntercept " +
         "set to false. To fit a model with 0 features, fitIntercept must be set to true." )
 
-    val w = if (!hasWeightCol) lit(1.0) else checkNonNegativeWeight(col($(weightCol)))
-    val offset = if (!hasOffsetCol) lit(0.0) else col($(offsetCol)).cast(DoubleType)
+    val validated = dataset.select(
+      checkRegressionLabels($(labelCol)),
+      checkNonNegativeWeights(get(weightCol)),
+      if (!hasOffsetCol) lit(0.0) else checkNonNanValues($(offsetCol), "Offsets"),
+      checkNonNanVectors($(featuresCol))
+    )
 
     val model = if (familyAndLink.family == Gaussian && familyAndLink.link == Identity) {
       // TODO: Make standardizeFeatures and standardizeLabel configurable.
-      val instances: RDD[Instance] =
-        dataset.select(col($(labelCol)), w, offset, col($(featuresCol))).rdd.map {
-          case Row(label: Double, weight: Double, offset: Double, features: Vector) =>
-            Instance(label - offset, weight, features)
-        }
+      val instances = validated.rdd.map {
+        case Row(label: Double, weight: Double, offset: Double, features: Vector) =>
+          Instance(label - offset, weight, features)
+      }
       val optimizer = new WeightedLeastSquares($(fitIntercept), $(regParam), elasticNetParam = 0.0,
         standardizeFeatures = true, standardizeLabel = true)
       val wlsModel = optimizer.fit(instances, instr = OptionalInstrumentation.create(instr),
@@ -421,11 +422,10 @@ class GeneralizedLinearRegression @Since("2.0.0") (@Since("2.0.0") override val 
         wlsModel.diagInvAtWA.toArray, 1, getSolver)
       model.setSummary(Some(trainingSummary))
     } else {
-      val instances: RDD[OffsetInstance] =
-        dataset.select(col($(labelCol)), w, offset, col($(featuresCol))).rdd.map {
-          case Row(label: Double, weight: Double, offset: Double, features: Vector) =>
-            OffsetInstance(label, weight, offset, features)
-        }
+      val instances = validated.rdd.map {
+        case Row(label: Double, weight: Double, offset: Double, features: Vector) =>
+          OffsetInstance(label, weight, offset, features)
+      }
       // Fit Generalized Linear Model by iteratively reweighted least squares (IRLS).
       val initialModel = familyAndLink.initialize(instances, $(fitIntercept), $(regParam),
         instr = OptionalInstrumentation.create(instr), $(aggregationDepth))
@@ -680,7 +680,7 @@ object GeneralizedLinearRegression extends DefaultParamsReadable[GeneralizedLine
     }
   }
 
-  private[regression] object Tweedie{
+  private[regression] object Tweedie {
 
     /** Constant used in initialization and deviance to avoid numerical issues. */
     val delta: Double = 0.1
@@ -1077,7 +1077,7 @@ class GeneralizedLinearRegressionModel private[ml] (
       this.logWarning(s"$uid: GeneralizedLinearRegressionModel.transform() does nothing" +
         " because no output columns were set.")
     }
-    outputData.toDF
+    outputData.toDF()
   }
 
   /**
@@ -1220,10 +1220,41 @@ class GeneralizedLinearRegressionSummary private[regression] (
 
   private[regression] lazy val link: Link = familyLink.link
 
+  /**
+   * summary row containing:
+   *  numInstances, weightSum, deviance, rss, weighted average of label - offset.
+   */
+  private lazy val glrSummary = {
+    val devUDF = udf { (label: Double, pred: Double, weight: Double) =>
+      family.deviance(label, pred, weight)
+    }
+    val devCol = sum(devUDF(label, prediction, weight))
+
+    val rssCol = if (model.getFamily.toLowerCase(Locale.ROOT) != Binomial.name &&
+      model.getFamily.toLowerCase(Locale.ROOT) != Poisson.name) {
+      val rssUDF = udf { (label: Double, pred: Double, weight: Double) =>
+        (label - pred) * (label - pred) * weight / family.variance(pred)
+      }
+      sum(rssUDF(label, prediction, weight))
+    } else {
+      lit(Double.NaN)
+    }
+
+    val avgCol = if (model.getFitIntercept &&
+      (!model.hasOffsetCol || (model.hasOffsetCol && family == Gaussian && link == Identity))) {
+      sum((label - offset) * weight) / sum(weight)
+    } else {
+      lit(Double.NaN)
+    }
+
+    predictions
+      .select(count(label), sum(weight), devCol, rssCol, avgCol)
+      .head()
+  }
+
   /** Number of instances in DataFrame predictions. */
   @Since("2.2.0")
-  lazy val numInstances: Long = predictions.count()
-
+  lazy val numInstances: Long = glrSummary.getLong(0)
 
   /**
    * Name of features. If the name cannot be retrieved from attributes,
@@ -1335,9 +1366,7 @@ class GeneralizedLinearRegressionSummary private[regression] (
        */
       if (!model.hasOffsetCol ||
         (model.hasOffsetCol && family == Gaussian && link == Identity)) {
-        val agg = predictions.agg(sum(weight.multiply(
-          label.minus(offset))), sum(weight)).first()
-        link.link(agg.getDouble(0) / agg.getDouble(1))
+        link.link(glrSummary.getDouble(4))
       } else {
         // Create empty feature column and fit intercept only model using param setting from model
         val featureNull = "feature_" + java.util.UUID.randomUUID.toString
@@ -1362,12 +1391,7 @@ class GeneralizedLinearRegressionSummary private[regression] (
    * The deviance for the fitted model.
    */
   @Since("2.0.0")
-  lazy val deviance: Double = {
-    predictions.select(label, prediction, weight).rdd.map {
-      case Row(label: Double, pred: Double, weight: Double) =>
-        family.deviance(label, pred, weight)
-    }.sum()
-  }
+  lazy val deviance: Double = glrSummary.getDouble(2)
 
   /**
    * The dispersion of the fitted model.
@@ -1381,20 +1405,20 @@ class GeneralizedLinearRegressionSummary private[regression] (
       model.getFamily.toLowerCase(Locale.ROOT) == Poisson.name) {
     1.0
   } else {
-    val rss = pearsonResiduals.agg(sum(pow(col("pearsonResiduals"), 2.0))).first().getDouble(0)
+    val rss = glrSummary.getDouble(3)
     rss / degreesOfFreedom
   }
 
   /** Akaike Information Criterion (AIC) for the fitted model. */
   @Since("2.0.0")
   lazy val aic: Double = {
-    val weightSum = predictions.select(weight).agg(sum(weight)).first().getDouble(0)
+    val weightSum = glrSummary.getDouble(1)
     val t = predictions.select(
       label, prediction, weight).rdd.map {
         case Row(label: Double, pred: Double, weight: Double) =>
           (label, pred, weight)
     }
-    family.aic(t, deviance, numInstances, weightSum) + 2 * rank
+    family.aic(t, deviance, numInstances.toDouble, weightSum) + 2 * rank
   }
 }
 
@@ -1555,7 +1579,7 @@ class GeneralizedLinearRegressionTrainingSummary private[regression] (
 
       data.foreach { case strRow: Array[String] =>
         strRow.zipWithIndex.map { case (cell: String, i: Int) =>
-          StringUtils.leftPad(cell.toString, colWidths(i))
+          StringUtils.leftPad(cell, colWidths(i))
         }.addString(sb, "", " ", "\n")
       }
 
